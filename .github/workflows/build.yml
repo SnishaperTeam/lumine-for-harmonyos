@@ -1,0 +1,82 @@
+name: HarmonyOS Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harmonyos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CLI_TOOLS_URL: https://repo.huaweicloud.com/harmonyos/command-line-tools/commandline-tools-linux-x64-5.1.1.830.zip
+  SDK_PACKAGE: HarmonyOS-SDK
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Restore command-line-tools cache
+        id: clt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/harmonyos-tools
+          key: harmonyos-clt-${{ env.CLI_TOOLS_URL }}
+
+      - name: Download command-line-tools
+        if: steps.clt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p ~/harmonyos-tools
+          cd ~/harmonyos-tools
+          curl -fsSL -o clt.zip "${CLI_TOOLS_URL}"
+          unzip -q clt.zip
+          rm -f clt.zip
+          ls -la ~/harmonyos-tools
+
+      - name: Install HarmonyOS SDK
+        shell: bash
+        env:
+          HOS_SDK_TOKEN: ${{ secrets.HOS_SDK_TOKEN }}
+        run: |
+          CLT_HOME="$(find ~/harmonyos-tools -maxdepth 1 -type d -name 'command-line-tools*' | head -1)"
+          if [[ -z "$CLT_HOME" ]]; then
+            echo "command-line-tools directory not found"
+            exit 1
+          fi
+          SDK_HOME="$HOME/harmonyos-sdk"
+          mkdir -p "$SDK_HOME"
+          SDKMGR="$CLT_HOME/bin/sdkmgr"
+          chmod +x "$CLT_HOME/bin/"* || true
+          if [[ -n "$HOS_SDK_TOKEN" ]]; then
+            "$SDKMGR" install "$SDK_PACKAGE" --sdk-folder="$SDK_HOME" --accept-license --token "$HOS_SDK_TOKEN" --yes
+          else
+            "$SDKMGR" install "$SDK_PACKAGE" --sdk-folder="$SDK_HOME" --accept-license --yes
+          fi
+          echo "DEVECO_SDK_HOME=$SDK_HOME" >> "$GITHUB_ENV"
+          echo "$CLT_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build HAP (debug)
+        shell: bash
+        run: |
+          hvigorw --mode module -p product=default -p buildMode=debug assembleHap --no-daemon
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumine-harmonyos-debug-${{ github.sha }}
+          path: entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+          retention-days: 14

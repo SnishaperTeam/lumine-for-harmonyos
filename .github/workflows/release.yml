@@ -1,0 +1,155 @@
+name: HarmonyOS Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Optional tag name to publish, for example v1.0.0
+        required: false
+        type: string
+      release_name:
+        description: Optional GitHub release title
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: harmonyos-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CLI_TOOLS_URL: https://repo.huaweicloud.com/harmonyos/command-line-tools/commandline-tools-linux-x64-5.1.1.830.zip
+  SDK_PACKAGE: HarmonyOS-SDK
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      HAP_GLOB: entry/build/default/outputs/default/*.hap
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore command-line-tools cache
+        id: clt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/harmonyos-tools
+          key: harmonyos-clt-${{ env.CLI_TOOLS_URL }}
+
+      - name: Download command-line-tools
+        if: steps.clt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p ~/harmonyos-tools
+          cd ~/harmonyos-tools
+          curl -fsSL -o clt.zip "${CLI_TOOLS_URL}"
+          unzip -q clt.zip
+          rm -f clt.zip
+
+      - name: Install HarmonyOS SDK
+        shell: bash
+        env:
+          HOS_SDK_TOKEN: ${{ secrets.HOS_SDK_TOKEN }}
+        run: |
+          CLT_HOME="$(find ~/harmonyos-tools -maxdepth 1 -type d -name 'command-line-tools*' | head -1)"
+          if [[ -z "$CLT_HOME" ]]; then
+            echo "command-line-tools directory not found"
+            exit 1
+          fi
+          SDK_HOME="$HOME/harmonyos-sdk"
+          mkdir -p "$SDK_HOME"
+          SDKMGR="$CLT_HOME/bin/sdkmgr"
+          chmod +x "$CLT_HOME/bin/"* || true
+          if [[ -n "$HOS_SDK_TOKEN" ]]; then
+            "$SDKMGR" install "$SDK_PACKAGE" --sdk-folder="$SDK_HOME" --accept-license --token "$HOS_SDK_TOKEN" --yes
+          else
+            "$SDKMGR" install "$SDK_PACKAGE" --sdk-folder="$SDK_HOME" --accept-license --yes
+          fi
+          echo "DEVECO_SDK_HOME=$SDK_HOME" >> "$GITHUB_ENV"
+          echo "$CLT_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build HAP (release)
+        shell: bash
+        run: |
+          hvigorw --mode module -p product=default -p buildMode=release assembleHap --no-daemon
+
+      - name: Compute artifact metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG_NAME: ${{ github.event.inputs.tag_name }}
+          INPUT_RELEASE_NAME: ${{ github.event.inputs.release_name }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${INPUT_TAG_NAME}"
+          fi
+
+          if [[ -n "$tag" ]]; then
+            should_release=true
+          else
+            tag="${GITHUB_SHA::7}"
+            should_release=false
+          fi
+
+          release_name="${INPUT_RELEASE_NAME}"
+          if [[ -z "$release_name" && -n "${GITHUB_REF_TYPE:-}" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_name="$tag"
+          fi
+
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "artifact_suffix=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumine-harmonyos-${{ steps.meta.outputs.artifact_suffix }}
+          path: ${{ env.HAP_GLOB }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: steps.meta.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          shopt -s nullglob
+          haps=(entry/build/default/outputs/default/*.hap)
+          if [[ ${#haps[@]} -eq 0 ]]; then
+            echo "HAP not found"
+            exit 1
+          fi
+          for hap in "${haps[@]}"; do
+            base_name="$(basename "$hap")"
+            cp "$hap" "release-assets/lumine-${{ steps.meta.outputs.artifact_suffix }}-${base_name}"
+          done
+          cd release-assets
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+          tag="${{ steps.meta.outputs.release_tag }}"
+          title="${{ steps.meta.outputs.release_name }}"
+          if [[ -z "$title" ]]; then
+            title="$tag"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --title "$title" \
+              --generate-notes \
+              --target "$GITHUB_SHA"
+          fi

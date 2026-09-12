@@ -45,7 +45,7 @@ jobs:
       - name: Build HAP (release)
         shell: bash
         env:
-          DEVECO_SDK_HOME: ${{ github.workspace }}/command-line-tools/sdk
+          DEVECO_SDK_HOME: ${{ env.HOS_SDK_HOME }}
         run: |
           hvigorw --mode module -p product=default -p buildMode=release assembleHap --no-daemon
 

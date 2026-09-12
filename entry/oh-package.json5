@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Lumine VPN client for HarmonyOS.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {},
+  "types": "./src/main/cpp/types/liblumine_napi/index.d.ets"
+}
+

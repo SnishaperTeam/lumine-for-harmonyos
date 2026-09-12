@@ -1,0 +1,16 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/Subscription",
+    "pages/RuleList",
+    "pages/RuleEditor",
+    "pages/Settings",
+    "pages/Logs",
+    "pages/About",
+    "pages/Proxies",
+    "pages/Routing",
+    "pages/AppRouting",
+    "pages/Dns",
+    "pages/Evolution"
+  ]
+}

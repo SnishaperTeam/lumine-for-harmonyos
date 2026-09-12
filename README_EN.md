@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README_EN.md) | [Русский](README_RU.md)
 
-[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-6.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=Last%20commit)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
+[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-5.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=Last%20commit)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
 
 **Lumine for HarmonyOS** is the HarmonyOS port of Lumine, a Clash-style local proxy / VPN client. The app takes over device traffic through a **VpnExtensionAbility (TUN)** tunnel and also offers a **local proxy listen** mode (SOCKS5 / HTTP loopback inbound); all forwarding and splitting happens inside the local core, with no WebView embedded.
 
@@ -32,7 +32,7 @@ The UI is natively built with **ArkTS + ArkUI**, following the HarmonyOS design 
 
 ### Install
 
-Download the HAP from [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) (requires HarmonyOS 6.0 / API 20 or later), or install it with `hdc`:
+Download the HAP from [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) (requires HarmonyOS 5.0 / API 12 or later), or install it with `hdc`:
 
 ```bash
 hdc install entry-default-unsigned.hap

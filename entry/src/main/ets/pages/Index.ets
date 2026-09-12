@@ -486,10 +486,11 @@ struct Index {
         .fontColor($r('app.color.font_secondary'))
         .width(88)
       if (showDot) {
-        Circle()
+        Column()
           .width(8)
           .height(8)
-          .fill($r('app.color.accent'))
+          .borderRadius(4)
+          .backgroundColor($r('app.color.accent'))
           .margin({ right: 8 })
       }
       Text(value)

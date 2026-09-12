@@ -245,12 +245,13 @@ struct Dns {
           Column() {
             ForEach(TYPE_OPTIONS, (opt: TypeOption) => {
               Row({ space: 12 }) {
-                Circle()
+                Column()
                   .width(18)
                   .height(18)
-                  .fill(Color.Transparent)
-                  .stroke(this.type === opt.id ? $r('app.color.accent') : $r('app.color.font_secondary'))
-                  .strokeWidth(this.type === opt.id ? 5 : 1.5)
+                  .borderRadius(9)
+                  .backgroundColor(Color.Transparent)
+                  .borderWidth(this.type === opt.id ? 5 : 1.5)
+                  .borderColor(this.type === opt.id ? $r('app.color.accent') : $r('app.color.font_secondary'))
                 Text(opt.label)
                   .fontSize(15)
                   .fontColor($r('app.color.font_primary'))

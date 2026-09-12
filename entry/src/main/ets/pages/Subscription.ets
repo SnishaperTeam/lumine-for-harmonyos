@@ -541,13 +541,14 @@ struct Subscription {
   SubscriptionCard(sub: SubscriptionProfile) {
     Column({ space: 12 }) {
       Row({ space: 8 }) {
-        Circle()
+        Column()
           .width(18)
           .height(18)
-          .fill(Color.Transparent)
-          .stroke(this.selectedConfigName === sub.configName
+          .borderRadius(9)
+          .backgroundColor(Color.Transparent)
+          .borderWidth(this.selectedConfigName === sub.configName ? 5 : 1.5)
+          .borderColor(this.selectedConfigName === sub.configName
             ? $r('app.color.accent') : $r('app.color.font_secondary'))
-          .strokeWidth(this.selectedConfigName === sub.configName ? 5 : 1.5)
         Column({ space: 2 }) {
           Text(sub.name)
             .fontSize(15)

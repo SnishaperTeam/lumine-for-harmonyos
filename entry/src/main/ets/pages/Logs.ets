@@ -443,10 +443,11 @@ struct Logs {
             ForEach(this.filteredLogs(), (entry: UiLogEntry) => {
               ListItem() {
                 Row({ space: 10 }) {
-                  Circle()
+                  Column()
                     .width(8)
                     .height(8)
-                    .fill(this.levelColor(entry.level))
+                    .borderRadius(4)
+                    .backgroundColor(this.levelColor(entry.level))
                   Column({ space: 4 }) {
                     Text(levelLabel(entry.level))
                       .fontSize(12)

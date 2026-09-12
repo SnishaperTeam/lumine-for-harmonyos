@@ -320,12 +320,13 @@ struct RuleList {
         .width('100%')
       ForEach(RULE_TYPE_OPTIONS, (opt: RuleTypeOption) => {
         Row({ space: 12 }) {
-          Circle()
+          Column()
             .width(18)
             .height(18)
-            .fill(Color.Transparent)
-            .stroke(this.newType === opt.id ? $r('app.color.accent') : $r('app.color.font_secondary'))
-            .strokeWidth(this.newType === opt.id ? 5 : 1.5)
+            .borderRadius(9)
+            .backgroundColor(Color.Transparent)
+            .borderWidth(this.newType === opt.id ? 5 : 1.5)
+            .borderColor(this.newType === opt.id ? $r('app.color.accent') : $r('app.color.font_secondary'))
           Column({ space: 2 }) {
             Text(opt.label)
               .fontSize(15)

@@ -97,7 +97,7 @@ struct About {
           .alignItems(VerticalAlign.Center)
 
           this.SectionLabel('版本信息')
-          this.Paragraph('当前版本 ' + this.appVersion + '，支持 HarmonyOS 6.0（API 20）及以上系统。')
+          this.Paragraph('当前版本 ' + this.appVersion + '，支持 HarmonyOS 5.0（API 12）及以上系统。')
           this.Paragraph('核心版本 ' + this.coreVersion + '（C++ 原生核心，经 NAPI 接入）。')
 
           this.SectionLabel('简介')

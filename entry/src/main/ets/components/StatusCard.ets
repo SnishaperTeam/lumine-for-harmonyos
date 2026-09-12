@@ -47,10 +47,11 @@ export struct StatusCard {
   @Builder
   StageIndicator() {
     Row({ space: 8 }) {
-      Circle()
+      Column()
         .width(10)
         .height(10)
-        .fill(this.getStageColor())
+        .borderRadius(5)
+        .backgroundColor(this.getStageColor())
       Text(this.getStageText())
         .fontSize(16)
         .fontWeight(FontWeight.Medium)

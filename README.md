@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README_EN.md) | [Русский](README_RU.md)
 
-[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-6.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/许可证-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=最后提交)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
+[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-5.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/许可证-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=最后提交)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
 
 **Lumine for HarmonyOS** 是 Lumine 在 HarmonyOS 平台的 Clash 风格本地代理 / VPN 客户端。应用通过 **VpnExtensionAbility（TUN）** 接管设备流量，并提供 **本地代理监听**（SOCKS5 / HTTP 回环入站）模式；所有转发与分流都在本地核心内完成，无任何 WebView 内嵌。
 
@@ -32,7 +32,7 @@
 
 ### 安装
 
-从 [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) 下载 HAP 安装包（需 HarmonyOS 6.0 / API 20 及以上），或使用 `hdc` 安装：
+从 [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) 下载 HAP 安装包（需 HarmonyOS 5.0 / API 12 及以上），或使用 `hdc` 安装：
 
 ```bash
 hdc install entry-default-unsigned.hap

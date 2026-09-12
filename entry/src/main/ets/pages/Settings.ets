@@ -798,12 +798,13 @@ struct Settings {
   @Builder
   RadioRow(label: string, selected: boolean, onSelect: () => void) {
     Row({ space: 12 }) {
-      Circle()
+      Column()
         .width(18)
         .height(18)
-        .fill(Color.Transparent)
-        .stroke(selected ? $r('app.color.accent') : $r('app.color.font_secondary'))
-        .strokeWidth(selected ? 5 : 1.5)
+        .borderRadius(9)
+        .backgroundColor(Color.Transparent)
+        .borderWidth(selected ? 5 : 1.5)
+        .borderColor(selected ? $r('app.color.accent') : $r('app.color.font_secondary'))
       Text(label)
         .fontSize(15)
         .fontColor($r('app.color.font_primary'))

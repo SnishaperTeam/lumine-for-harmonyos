@@ -578,13 +578,14 @@ struct RuleEditor {
   @Builder
   RadioRowMode(id: string, label: string, desc: string, usable: boolean) {
     Row({ space: 12 }) {
-      Circle()
+      Column()
         .width(18)
         .height(18)
-        .fill(Color.Transparent)
-        .stroke(this.modeDisplay() === id && usable
+        .borderRadius(9)
+        .backgroundColor(Color.Transparent)
+        .borderWidth(this.modeDisplay() === id && usable ? 5 : 1.5)
+        .borderColor(this.modeDisplay() === id && usable
           ? $r('app.color.accent') : $r('app.color.font_secondary'))
-        .strokeWidth(this.modeDisplay() === id && usable ? 5 : 1.5)
       Column({ space: 2 }) {
         Text(label)
           .fontSize(15)
@@ -611,13 +612,14 @@ struct RuleEditor {
   @Builder
   DnsRow(id: string, label: string) {
     Row({ space: 12 }) {
-      Circle()
+      Column()
         .width(18)
         .height(18)
-        .fill(Color.Transparent)
-        .stroke(this.dnsMode === id && !this.dnsDisabled(id)
+        .borderRadius(9)
+        .backgroundColor(Color.Transparent)
+        .borderWidth(this.dnsMode === id && !this.dnsDisabled(id) ? 5 : 1.5)
+        .borderColor(this.dnsMode === id && !this.dnsDisabled(id)
           ? $r('app.color.accent') : $r('app.color.font_secondary'))
-        .strokeWidth(this.dnsMode === id && !this.dnsDisabled(id) ? 5 : 1.5)
       Column({ space: 2 }) {
         Text(label)
           .fontSize(15)

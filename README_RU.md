@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README_EN.md) | [Русский](README_RU.md)
 
-[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-6.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/Лицензия-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=Последний%20коммит)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
+[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-5.0%2B-0D0D0D?style=flat&logo=huawei)](https://developer.huawei.com/consumer/cn/arkts/) [![License](https://img.shields.io/badge/Лицензия-AGPL--3.0-blue?style=flat&logo=open-source-initiative)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/SnishaperTeam/lumine-for-harmonyos?style=flat&logo=git&label=Последний%20коммит)](https://github.com/SnishaperTeam/lumine-for-harmonyos/commits/main)
 
 **Lumine for HarmonyOS** — это HarmonyOS-версия Lumine, локального прокси / VPN-клиента в стиле Clash. Приложение перехватывает трафик устройства через туннель **VpnExtensionAbility (TUN)**, а также предлагает режим **локального прокси-прослушивания** (входящие соединения SOCKS5 / HTTP на loopback); всё перенаправление и разделение трафика выполняется локальным ядром, без встроенного WebView.
 
@@ -32,7 +32,7 @@
 
 ### Установка
 
-Скачайте HAP из [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) (требуется HarmonyOS 6.0 / API 20 или новее) или установите через `hdc`:
+Скачайте HAP из [Releases](https://github.com/SnishaperTeam/lumine-for-harmonyos/releases) (требуется HarmonyOS 5.0 / API 12 или новее) или установите через `hdc`:
 
 ```bash
 hdc install entry-default-unsigned.hap

@@ -42,6 +42,19 @@ jobs:
       - name: Set up HarmonyOS command-line tools
         uses: ErBWs/setup-ohos@v2
 
+      - name: Strip local signing configs
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import re
+          p = 'build-profile.json5'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'"signingConfigs"\s*:\s*\[.*?\],\s*\n', '', s, flags=re.S)
+          s = re.sub(r'"signingConfig"\s*:\s*"default",\s*\n', '', s)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('signing configs stripped')
+          EOF
+
       - name: Build HAP (release)
         shell: bash
         env:

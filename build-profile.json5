@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "lumine-release-huawei.p12",
+          "storePassword": "0000001A41525F6CC97C08D6DEBD391B7CC9644E30DEBF018EE37E029658EE150C3312BB6200C2B59C85",
+          "keyAlias": "lumine",
+          "keyPassword": "0000001A0C1BB7EBFD81D4916C6301FC863F32265D03EBE360EDE62599A0207A2E1999391100157E670A",
+          "signAlg": "SHA256withECDSA",
+          "profile": "lumineRelease.p7b",
+          "certpath": "lumine.cer"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",

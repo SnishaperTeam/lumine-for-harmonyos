@@ -16,3 +16,7 @@
 /build_napi
 /build_napi_arm64
 /*.jpeg
+/*.p12
+/*.cer
+/*.csr
+/*.p7b

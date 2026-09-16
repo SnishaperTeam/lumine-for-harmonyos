@@ -13,6 +13,7 @@ set(CORE_SOURCES
     ccore/ltunnel.cpp
     ccore/lsocks5.cpp
     ccore/lhttp.cpp
+    ccore/ltun.cpp
     ccore/lcore.cpp
 )
 

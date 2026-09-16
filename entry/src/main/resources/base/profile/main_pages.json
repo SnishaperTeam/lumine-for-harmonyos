@@ -9,7 +9,6 @@
     "pages/About",
     "pages/Proxies",
     "pages/Routing",
-    "pages/AppRouting",
     "pages/Dns",
     "pages/Evolution"
   ]

@@ -1,6 +1,7 @@
 import { router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { connection, socket } from '@kit.NetworkKit';
+import { NetworkMonitor, mapNat64 } from '../service/NetworkMonitor';
 import { PrefsStore } from '../data/PrefsStore';
 import { NAT64Profile } from '../model/VpnTypes';
 
@@ -9,69 +10,6 @@ const SEED_PROFILES: NAT64Profile[] = [
   { id: 'nat64.net', name: 'nat64.net', prefix: '2a01:4f9:c010:3f02:64::' },
   { id: 'ztvi', name: 'ZTVI.org', prefix: '2602:fc59:11:64::' }
 ];
-
-function expandPrefixGroups(prefix: string): number[] | null {
-  const p = prefix.includes('/') ? prefix.substring(0, prefix.indexOf('/')) : prefix;
-  let groups: string[];
-  if (p.includes('::')) {
-    const parts = p.split('::');
-    if (parts.length > 2) {
-      return null;
-    }
-    const left = parts[0].length > 0 ? parts[0].split(':') : [];
-    const right = parts.length === 2 && parts[1].length > 0 ? parts[1].split(':') : [];
-    if (left.length + right.length > 7) {
-      return null;
-    }
-    groups = [];
-    for (let i = 0; i < 8; i++) {
-      if (i < left.length) {
-        groups.push(left[i]);
-      } else if (i < 8 - right.length) {
-        groups.push('0');
-      } else {
-        groups.push(right[i - (8 - right.length)]);
-      }
-    }
-  } else {
-    groups = p.split(':');
-    if (groups.length !== 8) {
-      return null;
-    }
-  }
-  const out: number[] = [];
-  for (let i = 0; i < 8; i++) {
-    const v = parseInt(groups[i], 16);
-    if (isNaN(v) || v < 0 || v > 0xffff) {
-      return null;
-    }
-    out.push(v);
-  }
-  return out;
-}
-
-function mapNat64(ipv4: string, prefix: string): string | null {
-  const segs = ipv4.split('.');
-  if (segs.length !== 4) {
-    return null;
-  }
-  const bytes: number[] = [];
-  for (let i = 0; i < 4; i++) {
-    const v = Number(segs[i]);
-    if (isNaN(v) || v < 0 || v > 255) {
-      return null;
-    }
-    bytes.push(v);
-  }
-  const g = expandPrefixGroups(prefix);
-  if (g === null) {
-    return null;
-  }
-  const h6 = (bytes[0] << 8) | bytes[1];
-  const h7 = (bytes[2] << 8) | bytes[3];
-  const groups = [g[0], g[1], g[2], g[3], g[4], g[5], h6, h7];
-  return groups.map((v: number) => v.toString(16)).join(':');
-}
 
 @Entry
 @Component
@@ -97,20 +35,8 @@ struct Proxies {
   }
 
   async probeIpv6(): Promise<void> {
-    const s = socket.constructTCPSocketInstance();
-    try {
-      await s.bind({ address: '::', port: 0, family: 2 });
-      await s.connect({ address: { address: '2606:4700:4700::1111', port: 443, family: 2 }, timeout: 3000 });
-      this.ipv6Ok = true;
-    } catch (err) {
-      this.ipv6Ok = false;
-    } finally {
-      try {
-        s.close();
-      } catch (e) {
-      }
-      this.ipv6Checked = true;
-    }
+    this.ipv6Ok = await NetworkMonitor.getInstance().checkIpv6Available();
+    this.ipv6Checked = true;
   }
 
   async loadProfiles(ctx: common.UIAbilityContext): Promise<void> {

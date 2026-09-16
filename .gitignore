@@ -20,3 +20,5 @@
 /*.cer
 /*.csr
 /*.p7b
+/build_host
+/.freebuff

@@ -138,19 +138,26 @@ int DialIpPort(const std::string& ip, int port, long long timeoutMs, std::string
         return -1;
     }
     if (rc != 0) {
+        int sr = 0;
+#ifdef _WIN32
+        // select() can block indefinitely inside a worker thread on some Winsock
+        // stacks; WSAPoll honours its timeout reliably.
+        struct pollfd pfd;
+        pfd.fd = SOCKET_CAST(fd);
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        sr = WSAPoll(&pfd, 1, static_cast<INT>(timeoutMs));
+#else
         fd_set wf;
         FD_ZERO(&wf);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Waddress"
-#pragma GCC diagnostic ignored "-Wsign-compare"
         FD_SET(fd, &wf);
-#pragma GCC diagnostic pop
         struct timeval tv;
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
-        int sr = select(fd + 1, nullptr, &wf, nullptr, &tv);
+        sr = select(fd + 1, nullptr, &wf, nullptr, &tv);
+#endif
         if (sr <= 0) {
-            errOut = sr == 0 ? "connection timeout" : std::string("select: ") + LastErrorString();
+            errOut = sr == 0 ? "connection timeout" : std::string("poll: ") + LastErrorString();
             KillSocket(fd);
             return -1;
         }

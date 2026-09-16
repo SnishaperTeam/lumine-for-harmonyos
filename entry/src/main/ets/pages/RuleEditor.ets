@@ -1,6 +1,6 @@
 import { router, promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
-import { socket } from '@kit.NetworkKit';
+import { NetworkMonitor } from '../service/NetworkMonitor';
 import { ConfigRepository } from '../data/ConfigRepository';
 import { PrefsStore } from '../data/PrefsStore';
 import { LumineConfig, Policy } from '../model/LumineConfig';
@@ -148,20 +148,7 @@ struct RuleEditor {
   }
 
   private async probeIpv6(): Promise<void> {
-    const s = socket.constructTCPSocketInstance();
-    let ok = false;
-    try {
-      await s.bind({ address: '::', port: 0, family: 2 });
-      await s.connect({ address: { address: '2606:4700:4700::1111', port: 443, family: 2 }, timeout: 3000 });
-      ok = true;
-    } catch (err) {
-      ok = false;
-    } finally {
-      try {
-        s.close();
-      } catch (e) {
-      }
-    }
+    const ok = await NetworkMonitor.getInstance().checkIpv6Available();
     if (this.prefs) {
       await this.prefs.setString('ipv6Available', ok ? '1' : '0');
     }

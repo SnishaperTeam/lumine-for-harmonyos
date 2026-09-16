@@ -1,7 +1,7 @@
 import { router } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { picker, fileIo } from '@kit.CoreFileKit';
-import { socket } from '@kit.NetworkKit';
+import { NetworkMonitor } from '../service/NetworkMonitor';
 import { ConfigRepository } from '../data/ConfigRepository';
 import { PrefsStore } from '../data/PrefsStore';
 import { LumineCore } from '../service/LumineCore';
@@ -292,20 +292,8 @@ struct Settings {
   }
 
   async probeIpv6(): Promise<void> {
-    const s = socket.constructTCPSocketInstance();
-    try {
-      await s.bind({ address: '::', port: 0, family: 2 });
-      await s.connect({ address: { address: '2606:4700:4700::1111', port: 443, family: 2 }, timeout: 3000 });
-      this.ipv6Ok = true;
-    } catch (err) {
-      this.ipv6Ok = false;
-    } finally {
-      try {
-        s.close();
-      } catch (e) {
-      }
-      this.ipv6Checked = true;
-    }
+    this.ipv6Ok = await NetworkMonitor.getInstance().checkIpv6Available(this.ipv6Checked);
+    this.ipv6Checked = true;
   }
 
   recheckNetwork(): void {
@@ -367,6 +355,16 @@ struct Settings {
     this.importing = true;
     try {
       const text: string = fileIo.readTextSync(picked[0]);
+      if (text.trim().length === 0) {
+        this.notice = '导入失败：文件内容为空';
+        return;
+      }
+      try {
+        JSON.parse(text);
+      } catch (e) {
+        this.notice = '导入失败：配置不是有效的 JSON';
+        return;
+      }
       if (this.core) {
         const err = this.core.checkConfigJson(text);
         if (err.length > 0 && err.indexOf('working directory not set') < 0) {

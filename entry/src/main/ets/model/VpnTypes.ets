@@ -21,12 +21,6 @@ export interface LogEntry {
   level: string;
 }
 
-export enum AppRoutingMode {
-  ALL = 'all',
-  WHITELIST = 'whitelist',
-  BYPASS = 'bypass'
-}
-
 export interface NAT64Profile {
   id: string;
   name: string;

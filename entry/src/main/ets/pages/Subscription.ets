@@ -213,6 +213,11 @@ struct Subscription {
   }
 
   async validateAndParse(text: string): Promise<string> {
+    try {
+      JSON.parse(text);
+    } catch (e) {
+      return '订阅内容不是有效的 Lumine 配置 JSON';
+    }
     const check = this.core.checkConfigJson(text);
     if (check === CORE_RUNNING_HINT) {
       return '核心正在运行，无法校验配置，请先停止核心后重试';
@@ -673,6 +678,12 @@ struct Subscription {
           .onChange((v: string) => {
             this.newUrl = v;
           })
+        if (this.newUrl.trim().toLowerCase().startsWith('http://')) {
+          Text('该链接为明文 HTTP，订阅内容将被未加密传输，建议使用 HTTPS。')
+            .fontSize(12)
+            .fontColor($r('app.color.error'))
+            .width('100%')
+        }
 
         if (this.importState.stage !== 'idle') {
           Column({ space: 10 }) {

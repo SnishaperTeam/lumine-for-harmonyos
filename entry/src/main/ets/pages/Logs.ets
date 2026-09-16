@@ -25,7 +25,7 @@ const FILTER_OPTIONS: FilterOption[] = [
   { id: 'other', label: '其他' }
 ];
 
-const MAX_UI_LOGS: number = 500;
+const MAX_UI_LOGS: number = 1000;
 
 function classifyLine(line: string): string {
   if (line.indexOf('ERROR') >= 0) {
@@ -72,7 +72,7 @@ function pad3(n: number): string {
 struct Logs {
   @State logs: UiLogEntry[] = [];
   @State filter: string = 'all';
-  @State captureEnabled: boolean = true;
+  @State captureEnabled: boolean = false;
   @State autoscroll: boolean = true;
   @State vpnStage: string = 'idle';
   @State exportMsg: string = '';
@@ -276,11 +276,25 @@ struct Logs {
       const fd = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
       fileIo.writeSync(fd.fd, body);
       fileIo.closeSync(fd);
+      this.pruneOldExports(dir);
       this.exportMsg = '已导出到 ' + path;
     } catch (err) {
       this.exportMsg = '导出日志失败';
     } finally {
       this.exporting = false;
+    }
+  }
+
+  pruneOldExports(dir: string): void {
+    try {
+      const files: string[] = fileIo.listFileSync(dir)
+        .filter((f: string) => f.startsWith('lumine-log-') && f.endsWith('.txt'))
+        .sort();
+      const excess: number = files.length - 10;
+      for (let i = 0; i < excess; i++) {
+        fileIo.unlinkSync(dir + '/' + files[i]);
+      }
+    } catch (err) {
     }
   }
 

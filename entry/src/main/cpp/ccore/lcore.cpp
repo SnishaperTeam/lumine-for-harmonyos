@@ -15,6 +15,7 @@
 #include "lnet.h"
 #include "lroute.h"
 #include "lsocks5.h"
+#include "ltun.h"
 #include "ltunnel.h"
 #include "ltypes.h"
 
@@ -308,7 +309,7 @@ std::string CoreStart(int fd, const char* cfgName) {
             }
         }
         if (startErr.empty() && fd >= 0) {
-            startErr = "TUN mode is not supported in the native core (fd passed)";
+            startErr = StartTun(fd);
         }
         if (!startErr.empty()) {
             return startErr;
@@ -332,11 +333,13 @@ std::string CoreStart(int fd, const char* cfgName) {
     std::string err;
     int sfd = CreateListener(socks5, 128, err);
     if (sfd < 0) {
+        if (fd >= 0) StopTun();
         g_running = false;
         return "listen " + socks5 + " failed: " + err;
     }
     int hfd = CreateListener(http, 128, err);
     if (hfd < 0) {
+        if (fd >= 0) StopTun();
         LCLOSE_SOCKET(sfd);
         g_running = false;
         return "listen " + http + " failed: " + err;
@@ -372,6 +375,7 @@ void CoreStop() {
         g_running = false;
     }
     gStopFlag.store(true);
+    StopTun();
     int sfd = g_socks5Lfd;
     int hfd = g_httpLfd;
     g_socks5Lfd = FdInvalid;

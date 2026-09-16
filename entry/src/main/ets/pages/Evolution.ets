@@ -3,6 +3,7 @@ import { common } from '@kit.AbilityKit';
 import { connection, socket } from '@kit.NetworkKit';
 import { ConfigRepository } from '../data/ConfigRepository';
 import { PrefsStore } from '../data/PrefsStore';
+import { NetworkMonitor, mapNat64 } from '../service/NetworkMonitor';
 import { LumineConfig, Policy } from '../model/LumineConfig';
 import { NAT64Profile } from '../model/VpnTypes';
 
@@ -14,69 +15,6 @@ interface EvoResult {
 }
 
 const TAB_LABELS: string[] = ['测试', '规则', '结果'];
-
-function expandPrefixGroups(prefix: string): number[] | null {
-  const p = prefix.includes('/') ? prefix.substring(0, prefix.indexOf('/')) : prefix;
-  let groups: string[];
-  if (p.includes('::')) {
-    const parts = p.split('::');
-    if (parts.length > 2) {
-      return null;
-    }
-    const left = parts[0].length > 0 ? parts[0].split(':') : [];
-    const right = parts.length === 2 && parts[1].length > 0 ? parts[1].split(':') : [];
-    if (left.length + right.length > 7) {
-      return null;
-    }
-    groups = [];
-    for (let i = 0; i < 8; i++) {
-      if (i < left.length) {
-        groups.push(left[i]);
-      } else if (i < 8 - right.length) {
-        groups.push('0');
-      } else {
-        groups.push(right[i - (8 - right.length)]);
-      }
-    }
-  } else {
-    groups = p.split(':');
-    if (groups.length !== 8) {
-      return null;
-    }
-  }
-  const out: number[] = [];
-  for (let i = 0; i < 8; i++) {
-    const v = parseInt(groups[i], 16);
-    if (isNaN(v) || v < 0 || v > 0xffff) {
-      return null;
-    }
-    out.push(v);
-  }
-  return out;
-}
-
-function mapNat64(ipv4: string, prefix: string): string | null {
-  const segs = ipv4.split('.');
-  if (segs.length !== 4) {
-    return null;
-  }
-  const bytes: number[] = [];
-  for (let i = 0; i < 4; i++) {
-    const v = Number(segs[i]);
-    if (isNaN(v) || v < 0 || v > 255) {
-      return null;
-    }
-    bytes.push(v);
-  }
-  const g = expandPrefixGroups(prefix);
-  if (g === null) {
-    return null;
-  }
-  const h6 = (bytes[0] << 8) | bytes[1];
-  const h7 = (bytes[2] << 8) | bytes[3];
-  const groups = [g[0], g[1], g[2], g[3], g[4], g[5], h6, h7];
-  return groups.map((v: number) => v.toString(16)).join(':');
-}
 
 function isIpLiteral(host: string): boolean {
   if (host.indexOf(':') >= 0) {
@@ -118,6 +56,7 @@ struct Evolution {
   @State nat64Prefix: string = '';
 
   private repo: ConfigRepository | null = null;
+  private monitor: NetworkMonitor = NetworkMonitor.getInstance();
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
@@ -125,8 +64,7 @@ struct Evolution {
     this.repo.init().then(() => {
       this.loadConfig();
     });
-    this.probeIpv6();
-    this.detectNat64Prefix(ctx);
+    this.refreshNetworkState();
   }
 
   async loadConfig(): Promise<void> {
@@ -136,58 +74,24 @@ struct Evolution {
     this.config = await this.repo.loadConfig('config');
   }
 
-  async probeIpv6(): Promise<void> {
-    const s = socket.constructTCPSocketInstance();
-    try {
-      await s.bind({ address: '::', port: 0, family: 2 });
-      await s.connect({ address: { address: '2606:4700:4700::1111', port: 443, family: 2 }, timeout: 3000 });
-      this.ipv6Ok = true;
-    } catch (err) {
-      this.ipv6Ok = false;
-    } finally {
+  async refreshNetworkState(): Promise<void> {
+    this.ipv6Ok = await this.monitor.checkIpv6Available();
+    let prefix = await this.monitor.detectNat64Prefix();
+    if (prefix.length === 0) {
       try {
-        s.close();
-      } catch (e) {
-      }
-    }
-  }
-
-  async detectNat64Prefix(ctx: common.UIAbilityContext): Promise<void> {
-    try {
-      const netHandle = await connection.getDefaultNet();
-      if (netHandle) {
-        const addrs = await netHandle.getAddressesByName('ipv4only.arpa');
-        for (const a of addrs) {
-          const ip = a.address;
-          if (ip.indexOf(':') < 0) {
-            continue;
-          }
-          const g = expandPrefixGroups(ip);
-          if (g !== null && g[6] === 0xc000 && (g[7] === 0x00aa || g[7] === 0x00ab)) {
-            const parts: string[] = [];
-            for (let i = 0; i < 6; i++) {
-              parts.push(g[i].toString(16));
-            }
-            this.nat64Prefix = parts.join(':');
-            break;
-          }
-        }
-      }
-    } catch (err) {
-    }
-    if (this.nat64Prefix.length === 0) {
-      try {
+        const ctx = getContext(this) as common.UIAbilityContext;
         const prefs = await PrefsStore.getInstance(ctx);
         const raw = await prefs.getString('nat64Profiles', '');
         if (raw.length > 0) {
           const profiles = JSON.parse(raw) as NAT64Profile[];
           if (profiles.length > 0) {
-            this.nat64Prefix = profiles[0].prefix;
+            prefix = profiles[0].prefix;
           }
         }
       } catch (err) {
       }
     }
+    this.nat64Prefix = prefix;
   }
 
   ipv6Usable(): boolean {

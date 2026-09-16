@@ -21,7 +21,6 @@ const NAV_ITEMS: NavItem[] = [
   { label: '代理节点', path: 'pages/Proxies' },
   { label: '分流规则', path: 'pages/RuleList' },
   { label: '自动分流', path: 'pages/Routing' },
-  { label: '分应用路由', path: 'pages/AppRouting' },
   { label: 'DNS 设置', path: 'pages/Dns' },
   { label: '进化模式', path: 'pages/Evolution' },
   { label: '实时日志', path: 'pages/Logs' },
@@ -78,32 +77,58 @@ struct Index {
   private core: LumineCore = LumineCore.getInstance();
   private pollTimer: number = -1;
   private localError: string = '';
+  private toggleCount: number = 0;
+  private toggleWindowStart: number = 0;
+  private cooldownUntil: number = 0;
+  private statsTick: number = 0;
+  private shouldRunMarked: boolean = false;
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
     this.statusStore = StatusStore.getInstance(ctx);
     this.repo = ConfigRepository.getInstance(ctx);
-    this.configName = DEFAULT_CONFIG_NAME;
     this.initRepo();
     this.startPolling();
+  }
+
+  private async initRepo(): Promise<void> {
+    const repo = this.repo;
+    if (!repo) {
+      return;
+    }
+    try {
+      await repo.init();
+      const selected = await repo.getSelectedConfigName();
+      if (selected.length > 0) {
+        this.configName = selected;
+      }
+      this.loadWorkMode();
+      this.checkColdRecovery();
+    } catch (err) {
+      hilog.error(0x0000, 'LumineUI', 'repo init failed: %{public}s', String(err));
+    }
+  }
+
+  private async checkColdRecovery(): Promise<void> {
+    const repo = this.repo;
+    if (!repo || this.isConnected() || this.core.isRunning()) {
+      return;
+    }
+    try {
+      const shouldRun = await repo.getVpnShouldRun();
+      if (shouldRun && this.vpnStage === RuntimeStatus.IDLE) {
+        this.localError = '上次代理异常退出，请重新开启代理';
+        this.error = this.localError;
+      }
+    } catch (err) {
+      hilog.error(0x0000, 'LumineUI', 'cold recovery check failed: %{public}s', String(err));
+    }
   }
 
   aboutToDisappear(): void {
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
     }
-  }
-
-  private initRepo(): void {
-    const repo = this.repo;
-    if (!repo) {
-      return;
-    }
-    repo.init().then(() => {
-      this.loadWorkMode();
-    }).catch((err: BusinessError) => {
-      hilog.error(0x0000, 'LumineUI', 'repo init failed: %{public}s', String(err));
-    });
   }
 
   private loadWorkMode(): void {
@@ -133,12 +158,18 @@ struct Index {
         this.vpnStage = state.stage;
         if (state.stage === RuntimeStatus.RUNNING) {
           this.localError = '';
+          if (!this.shouldRunMarked && this.repo) {
+            this.shouldRunMarked = true;
+            this.repo.setVpnShouldRun(true).catch(() => {});
+            this.repo.setLastRunningConfig(this.configName).catch(() => {});
+          }
         }
         this.error = state.error || this.localError;
         this.settlePending(state.stage);
         this.syncDevListening();
         this.syncNotification();
-        if (state.stats) {
+        this.statsTick++;
+        if (state.stats && this.statsTick % 2 === 0) {
           this.down = formatBytes(state.stats.down);
           this.up = formatBytes(state.stats.up);
           this.blocked = String(state.stats.blocked);
@@ -224,6 +255,9 @@ struct Index {
   }
 
   private statusTitle(): string {
+    if (this.isBusy() && (this.pendingAction === 'stop' || this.vpnStage === RuntimeStatus.STOPPING)) {
+      return '正在断开代理';
+    }
     if (this.isBusy() && this.isConnected()) {
       return '正在断开代理';
     }
@@ -539,6 +573,24 @@ struct Index {
     if (this.isBusy()) {
       return;
     }
+    const now = Date.now();
+    if (now < this.cooldownUntil) {
+      this.localError = '点击频率过高，请 ' + Math.ceil((this.cooldownUntil - now) / 1000) + ' 秒后再试';
+      this.error = this.localError;
+      return;
+    }
+    if (now - this.toggleWindowStart > 2000) {
+      this.toggleWindowStart = now;
+      this.toggleCount = 0;
+    }
+    this.toggleCount++;
+    if (this.toggleCount > 5) {
+      this.cooldownUntil = now + 3000;
+      this.toggleCount = 0;
+      this.localError = '点击频率过高，请 3 秒后再试';
+      this.error = this.localError;
+      return;
+    }
     if (this.devListening) {
       this.core.stop();
       this.devListening = false;
@@ -575,6 +627,17 @@ struct Index {
     this.localError = '';
     try {
       const ctx = getContext(this) as common.UIAbilityContext;
+      if (this.statusStore) {
+        await this.statusStore.writeVpnState({
+          stage: RuntimeStatus.STOPPING,
+          updatedAt: Date.now()
+        });
+        this.vpnStage = RuntimeStatus.STOPPING;
+      }
+      if (this.repo) {
+        this.repo.setVpnShouldRun(false).catch(() => {});
+        this.shouldRunMarked = false;
+      }
       await this.controller.stopVpn(ctx);
     } catch (err) {
       const e = err as BusinessError;

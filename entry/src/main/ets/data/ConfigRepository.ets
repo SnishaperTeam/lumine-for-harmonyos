@@ -7,6 +7,37 @@ import { PrefsStore } from './PrefsStore';
 const CONFIGS_DIR = 'configs';
 const EXPORTS_DIR = 'exports';
 const MAX_EXPORTS = 10;
+const MAX_CONFIG_NAME_LEN = 64;
+
+export function isSafeConfigName(name: string): boolean {
+  if (name.length === 0 || name.length > MAX_CONFIG_NAME_LEN) {
+    return false;
+  }
+  if (name.startsWith('.')) {
+    return false;
+  }
+  if (name.includes('/') || name.includes('\\') || name.includes('..') || name.includes(':')) {
+    return false;
+  }
+  for (let i = 0; i < name.length; i++) {
+    const code = name.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function sanitizeConfigName(name: string, fallback: string): string {
+  if (isSafeConfigName(name)) {
+    return name;
+  }
+  const cleaned = name.replace(/[^a-zA-Z0-9_\u4e00-\u9fff-]/g, '_').substring(0, MAX_CONFIG_NAME_LEN);
+  if (isSafeConfigName(cleaned)) {
+    return cleaned;
+  }
+  return fallback;
+}
 
 export interface ImportResult {
   config: LumineConfig;
@@ -27,17 +58,23 @@ export class ConfigRepository {
   }
 
   async init(): Promise<void> {
-    this.prefs = await PrefsStore.getInstance(this.context!);
-    this.ensureDir(this.context!.filesDir + '/' + CONFIGS_DIR);
-    this.ensureDir(this.context!.cacheDir + '/' + EXPORTS_DIR);
+    if (!this.context) {
+      return;
+    }
+    this.prefs = await PrefsStore.getInstance(this.context);
+    this.ensureDir(this.context.filesDir + '/' + CONFIGS_DIR);
+    this.ensureDir(this.context.cacheDir + '/' + EXPORTS_DIR);
     await this.ensureDefaultConfig();
   }
 
   private ensureDir(path: string): void {
-    if (fileIo.accessSync(path)) {
-      return;
+    try {
+      if (fileIo.accessSync(path)) {
+        return;
+      }
+      fileIo.mkdirSync(path, true);
+    } catch {
     }
-    fileIo.mkdirSync(path, true);
   }
 
   private async ensureDefaultConfig(): Promise<void> {
@@ -55,16 +92,23 @@ export class ConfigRepository {
   }
 
   private getConfigPath(name: string): string {
-    return this.context!.filesDir + '/' + CONFIGS_DIR + '/' + name + '.json';
+    if (!this.context) {
+      return '';
+    }
+    return this.context.filesDir + '/' + CONFIGS_DIR + '/' + sanitizeConfigName(name, 'config') + '.json';
   }
 
   async listConfigs(): Promise<string[]> {
-    const configsPath = this.context!.filesDir + '/' + CONFIGS_DIR;
+    if (!this.context) {
+      return [];
+    }
+    const configsPath = this.context.filesDir + '/' + CONFIGS_DIR;
     try {
       const entries = fileIo.listFileSync(configsPath);
       return entries
         .filter((e: string) => e.endsWith('.json'))
-        .map((e: string) => e.replace('.json', ''))
+        .map((e: string) => e.substring(0, e.length - '.json'.length))
+        .filter((e: string) => isSafeConfigName(e))
         .sort();
     } catch {
       return [];
@@ -74,6 +118,9 @@ export class ConfigRepository {
   async loadConfig(name: string): Promise<LumineConfig | null> {
     try {
       const path = this.getConfigPath(name);
+      if (path.length === 0) {
+        return null;
+      }
       const content = fileIo.readTextSync(path);
       return parseLumineConfig(content);
     } catch {
@@ -83,51 +130,88 @@ export class ConfigRepository {
 
   async saveConfig(name: string, config: LumineConfig): Promise<void> {
     const path = this.getConfigPath(name);
+    if (path.length === 0) {
+      throw new Error('存储未就绪');
+    }
     const json = serializeLumineConfig(config);
-    const fd = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
-    fileIo.writeSync(fd.fd, json);
-    fileIo.closeSync(fd);
+    const file = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
+    try {
+      fileIo.writeSync(file.fd, json);
+    } finally {
+      try {
+        fileIo.closeSync(file);
+      } catch {
+      }
+    }
   }
 
   async deleteConfig(name: string): Promise<void> {
-    if (name === 'config') return;
+    if (name === 'config') {
+      return;
+    }
     try {
       const path = this.getConfigPath(name);
+      if (path.length === 0) {
+        return;
+      }
       fileIo.unlinkSync(path);
     } catch {
-      // Best effort
     }
   }
 
   async getSelectedConfigName(): Promise<string> {
-    return await this.prefs!.getString('selectedConfig', 'config');
+    if (!this.prefs) {
+      return 'config';
+    }
+    return await this.prefs.getString('selectedConfig', 'config');
   }
 
   async setSelectedConfigName(name: string): Promise<void> {
-    await this.prefs!.setString('selectedConfig', name);
+    if (!this.prefs) {
+      return;
+    }
+    await this.prefs.setString('selectedConfig', sanitizeConfigName(name, 'config'));
   }
 
   async getVpnShouldRun(): Promise<boolean> {
-    return await this.prefs!.getBool('vpnShouldRun', false);
+    if (!this.prefs) {
+      return false;
+    }
+    return await this.prefs.getBool('vpnShouldRun', false);
   }
 
   async setVpnShouldRun(value: boolean): Promise<void> {
-    await this.prefs!.setBool('vpnShouldRun', value);
+    if (!this.prefs) {
+      return;
+    }
+    await this.prefs.setBool('vpnShouldRun', value);
   }
 
   async getLastRunningConfig(): Promise<string> {
-    return await this.prefs!.getString('lastRunningConfig', 'config');
+    if (!this.prefs) {
+      return 'config';
+    }
+    return await this.prefs.getString('lastRunningConfig', 'config');
   }
 
   async setLastRunningConfig(name: string): Promise<void> {
-    await this.prefs!.setString('lastRunningConfig', name);
+    if (!this.prefs) {
+      return;
+    }
+    await this.prefs.setString('lastRunningConfig', sanitizeConfigName(name, 'config'));
   }
 
   async disabledRuleKeys(configName: string): Promise<string[]> {
-    return await this.prefs!.getStringList('disabledRules_' + configName);
+    if (!this.prefs) {
+      return [];
+    }
+    return await this.prefs.getStringList('disabledRules_' + configName);
   }
 
   async setRuleEnabled(configName: string, config: LumineConfig, ruleKey: string, enabled: boolean): Promise<void> {
+    if (!this.prefs) {
+      return;
+    }
     let disabled = await this.disabledRuleKeys(configName);
     if (enabled) {
       disabled = disabled.filter((k: string) => k !== ruleKey);
@@ -136,7 +220,7 @@ export class ConfigRepository {
         disabled.push(ruleKey);
       }
     }
-    await this.prefs!.setStringList('disabledRules_' + configName, disabled);
+    await this.prefs.setStringList('disabledRules_' + configName, disabled);
   }
 
   async importConfig(json: string): Promise<ImportResult> {
@@ -145,7 +229,8 @@ export class ConfigRepository {
       const result: ImportResult = { config: config, error: null };
       return result;
     } catch (e) {
-      const result: ImportResult = { config: defaultLumineConfig(), error: '配置解析失败: ' + String(e) };
+      const detail = e instanceof Error ? e.message : String(e);
+      const result: ImportResult = { config: defaultLumineConfig(), error: '配置解析失败: ' + detail };
       return result;
     }
   }
@@ -153,7 +238,9 @@ export class ConfigRepository {
   async exportConfig(name: string): Promise<string | null> {
     try {
       const config = await this.loadConfig(name);
-      if (!config) return null;
+      if (!config) {
+        return null;
+      }
       return serializeLumineConfig(config);
     } catch {
       return null;

@@ -1,15 +1,19 @@
 export function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return bytes + ' B';
+  const value = typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  if (value < 1024) {
+    return value + ' B';
   }
-  if (bytes < 1024 * 1024) {
-    return (bytes / 1024).toFixed(1) + ' KB';
+  if (value < 1024 * 1024) {
+    return (value / 1024).toFixed(1) + ' KB';
   }
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  if (value < 1024 * 1024 * 1024) {
+    return (value / (1024 * 1024)).toFixed(2) + ' MB';
+  }
+  return (value / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
 export function formatUptime(ms: number): string {
-  if (ms <= 0) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) {
     return '00:00:00';
   }
   const totalSeconds = Math.floor(ms / 1000);
@@ -20,6 +24,9 @@ export function formatUptime(ms: number): string {
 }
 
 export function formatRelativeTime(timestamp: number): string {
+  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) {
+    return '时间未知';
+  }
   const now = Date.now();
   const diff = now - timestamp;
   if (diff < 60000) {

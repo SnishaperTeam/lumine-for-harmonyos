@@ -123,6 +123,8 @@ function parsePort(raw: string, fallback: number): number {
   return fallback;
 }
 
+const MAX_IMPORT_BYTES: number = 4 * 1024 * 1024;
+
 @Entry
 @Component
 struct Settings {
@@ -354,6 +356,15 @@ struct Settings {
     }
     this.importing = true;
     try {
+      const size: number = fileIo.statSync(picked[0]).size;
+      if (size <= 0) {
+        this.notice = '导入失败：文件内容为空';
+        return;
+      }
+      if (size > MAX_IMPORT_BYTES) {
+        this.notice = '导入失败：配置文件超过 4 MB';
+        return;
+      }
       const text: string = fileIo.readTextSync(picked[0]);
       if (text.trim().length === 0) {
         this.notice = '导入失败：文件内容为空';
@@ -403,8 +414,14 @@ struct Settings {
       }
       const path = dir + '/lumine_config_' + Date.now() + '.json';
       const fd = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(fd.fd, json);
-      fileIo.closeSync(fd);
+      try {
+        fileIo.writeSync(fd.fd, json);
+      } finally {
+        try {
+          fileIo.closeSync(fd);
+        } catch (closeErr) {
+        }
+      }
       this.notice = '已导出 ' + json.length + ' 字节到 ' + path;
     } catch (e) {
       this.notice = '导出失败：' + String(e);

@@ -11,6 +11,7 @@ import { VpnState, SessionStats, LogEntry, RuntimeStatus } from '../model/VpnTyp
 
 const DOMAIN = 0x0000;
 const TAG = 'LumineExt';
+const MAX_LOG_LINES_PER_PUMP = 100;
 
 export default class LumineVpnExtAbility extends VpnExtensionAbility {
   private tunFd: number = -1;
@@ -135,7 +136,10 @@ export default class LumineVpnExtAbility extends VpnExtensionAbility {
 
         if (logsStr) {
           const logLines = logsStr.split('\n').filter((l: string) => l.length > 0);
-          for (const line of logLines) {
+          const batch = logLines.length > MAX_LOG_LINES_PER_PUMP
+            ? logLines.slice(logLines.length - MAX_LOG_LINES_PER_PUMP)
+            : logLines;
+          for (const line of batch) {
             const entry: LogEntry = {
               raw: line,
               timestamp: Date.now(),
@@ -175,6 +179,9 @@ export default class LumineVpnExtAbility extends VpnExtensionAbility {
   }
 
   private async handleError(error: string): Promise<void> {
+    if (this.errored) {
+      return;
+    }
     this.errored = true;
     this.crashCount++;
     this.lastCrashTime = Date.now();

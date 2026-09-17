@@ -3,7 +3,7 @@ import { common } from '@kit.AbilityKit';
 import { connection, socket } from '@kit.NetworkKit';
 import { NetworkMonitor, mapNat64 } from '../service/NetworkMonitor';
 import { PrefsStore } from '../data/PrefsStore';
-import { NAT64Profile } from '../model/VpnTypes';
+import { NAT64Profile, sanitizeNAT64Profiles } from '../model/VpnTypes';
 
 const SEED_PROFILES: NAT64Profile[] = [
   { id: 'level66', name: 'level66', prefix: '2001:67c:2960:6464::' },
@@ -42,14 +42,7 @@ struct Proxies {
   async loadProfiles(ctx: common.UIAbilityContext): Promise<void> {
     this.prefs = await PrefsStore.getInstance(ctx);
     const raw = await this.prefs.getString('nat64Profiles', '');
-    let loaded: NAT64Profile[] = [];
-    if (raw.length > 0) {
-      try {
-        loaded = JSON.parse(raw) as NAT64Profile[];
-      } catch {
-        loaded = [];
-      }
-    }
+    let loaded: NAT64Profile[] = sanitizeNAT64Profiles(raw);
     if (loaded.length === 0) {
       loaded = SEED_PROFILES;
     }

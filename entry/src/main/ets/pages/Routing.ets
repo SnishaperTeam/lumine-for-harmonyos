@@ -8,6 +8,8 @@ import { LumineCore } from '../service/LumineCore';
 import { LumineConfig } from '../model/LumineConfig';
 import { RuntimeStatus, VpnState } from '../model/VpnTypes';
 
+const MAX_LOG_CHUNK_BYTES: number = 256 * 1024;
+
 interface PolicyOption {
   id: string;
   label: string;
@@ -37,6 +39,7 @@ struct Routing {
   private flowBuffer: string[] = [];
   private logFilePath: string = '';
   private logOffset: number = 0;
+  private flowBusy: boolean = false;
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
@@ -90,15 +93,19 @@ struct Routing {
       }
       const size: number = fileIo.statSync(this.logFilePath).size;
       if (size <= this.logOffset) {
-        this.logOffset = size;
+        this.logOffset = size > 0 ? size : 0;
         return '';
       }
-      const length: number = size - this.logOffset;
+      const pending: number = size - this.logOffset;
+      const length: number = pending > MAX_LOG_CHUNK_BYTES ? MAX_LOG_CHUNK_BYTES : pending;
       const fd = fileIo.openSync(this.logFilePath, fileIo.OpenMode.READ_ONLY);
       try {
         const buf = new ArrayBuffer(length);
         const read: number = fileIo.readSync(fd.fd, buf, { offset: this.logOffset, length: length });
-        this.logOffset = size;
+        if (read <= 0) {
+          return '';
+        }
+        this.logOffset += read;
         const decoder = new util.TextDecoder('utf-8');
         return decoder.decodeToString(new Uint8Array(buf, 0, read));
       } finally {
@@ -110,32 +117,41 @@ struct Routing {
   }
 
   async pollFlow(): Promise<void> {
-    if (this.statusStore) {
-      const state: VpnState = await this.statusStore.readVpnState();
-      this.connected = state.stage === RuntimeStatus.RUNNING;
-    }
-    if (!this.connected) {
-      this.flowBuffer = [];
-      this.recentFlow = [];
+    if (this.flowBusy) {
       return;
     }
-    const chunk = await this.readCoreChunk();
-    if (chunk.length > 0) {
-      const lines: string[] = chunk.split('\n');
-      for (const line of lines) {
-        const t = line.trim();
-        if (t.length === 0) {
-          continue;
+    this.flowBusy = true;
+    try {
+      if (this.statusStore) {
+        const state: VpnState = await this.statusStore.readVpnState();
+        this.connected = state.stage === RuntimeStatus.RUNNING;
+      }
+      if (!this.connected) {
+        this.flowBuffer = [];
+        this.recentFlow = [];
+        return;
+      }
+      const chunk = await this.readCoreChunk();
+      if (chunk.length > 0) {
+        const lines: string[] = chunk.split('\n');
+        for (const line of lines) {
+          const t = line.trim();
+          if (t.length === 0) {
+            continue;
+          }
+          if (t.indexOf('[TCP]') >= 0 || t.indexOf('[UDP]') >= 0) {
+            this.flowBuffer.push(t);
+          }
         }
-        if (t.indexOf('[TCP]') >= 0 || t.indexOf('[UDP]') >= 0) {
-          this.flowBuffer.push(t);
+        if (this.flowBuffer.length > 4) {
+          this.flowBuffer = this.flowBuffer.slice(this.flowBuffer.length - 4);
         }
       }
-      if (this.flowBuffer.length > 4) {
-        this.flowBuffer = this.flowBuffer.slice(this.flowBuffer.length - 4);
-      }
+      this.recentFlow = this.flowBuffer.slice();
+    } catch (err) {
+    } finally {
+      this.flowBusy = false;
     }
-    this.recentFlow = this.flowBuffer.slice();
   }
 
   build() {

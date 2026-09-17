@@ -31,9 +31,11 @@ namespace lcore {
 
 std::atomic<bool> gStopFlag{false};
 
-Config g_coreConfig;
+// Immutable config snapshot. Readers take a copy of the pointer, so a reload
+// can never free the object underneath them.
+std::shared_ptr<const Config> g_coreConfig;
 
-Config& GetCoreConfig() { return g_coreConfig; }
+std::shared_ptr<const Config> GetCoreConfig() { return g_coreConfig; }
 
 long long NowMs() {
     using namespace std::chrono;
@@ -46,6 +48,7 @@ namespace {
 
 constexpr std::size_t kRingMax = 500;
 constexpr long long kRotateBytes = 1 << 20;
+constexpr std::size_t kMaxConfigBytes = 4 << 20;
 
 std::string Timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -184,7 +187,29 @@ std::string Logger::Cat(const std::string& a, const std::string& b) { return a +
 
 // ---------------------------------------------------------------- config ----
 
-bool ParseConfigFile(const std::string& dir, const std::string& cfgName, std::string& err) {
+namespace {
+
+// cfgName is selected by the UI, but it is interpolated straight into a path.
+// Reject anything that could escape configs/ (separators, drive prefixes,
+// traversal components) so a crafted name cannot read arbitrary .json files.
+bool IsSafeConfigName(const std::string& name) {
+    if (name.empty() || name.size() > 128) return false;
+    if (name.front() == '.') return false;
+    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos) return false;
+    if (name.find("..") != std::string::npos) return false;
+    for (char c : name) {
+        if (static_cast<unsigned char>(c) < 0x20) return false;  // control chars
+    }
+    return true;
+}
+
+}  // namespace
+
+bool ParseConfigFileInto(const std::string& dir, const std::string& cfgName, Config& out, std::string& err) {
+    if (!IsSafeConfigName(cfgName)) {
+        err = "load config error: invalid config name";
+        return false;
+    }
     std::string path = dir + "/configs/" + cfgName + ".json";
     std::ifstream in(path);
     if (!in) {
@@ -192,18 +217,34 @@ bool ParseConfigFile(const std::string& dir, const std::string& cfgName, std::st
         return false;
     }
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.size() > kMaxConfigBytes) {
+        err = "load config error: config file too large";
+        return false;
+    }
     Json root;
     std::string jerr;
     if (!Json::Parse(text, root, jerr)) {
         err = "load config error: parse " + path + ": " + jerr;
         return false;
     }
-    g_coreConfig = Config();
-    std::string perr = ParseConfigJson(root, g_coreConfig);
+    out = Config();
+    std::string perr = ParseConfigJson(root, out);
     if (!perr.empty()) {
         err = "load config error: " + perr;
         return false;
     }
+    return true;
+}
+
+bool ParseConfigFile(const std::string& dir, const std::string& cfgName, std::string& err) {
+    // Build the replacement off to the side and publish it in one atomic
+    // pointer store: a partially constructed Config must never be visible to
+    // the proxy/TUN workers that read GetCoreConfig().
+    auto next = std::make_shared<Config>();
+    if (!ParseConfigFileInto(dir, cfgName, *next, err)) {
+        return false;
+    }
+    g_coreConfig = next;
     return true;
 }
 
@@ -219,7 +260,12 @@ int g_httpLfd = FdInvalid;
 std::thread g_socks5Thr;
 std::thread g_httpThr;
 std::thread g_statsThr;
-std::string g_lastError;
+
+// Bound per-process proxy worker threads: every accepted connection also
+// spawns two relay threads, so without a cap a flood of localhost connects
+// (a malicious app on the device) can exhaust threads/memory.
+constexpr int kMaxProxyWorkers = 256;
+std::atomic<int> g_activeWorkers{0};
 
 // Primary accept loop. proto: "socks5" | "http".
 void AcceptLoop(int lfd, const char* proto) {
@@ -230,25 +276,45 @@ void AcceptLoop(int lfd, const char* proto) {
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             continue;
         }
+        if (g_activeWorkers.load() >= kMaxProxyWorkers) {
+            KillSocket(c);  // shed load; clients retry/back off
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        g_activeWorkers.fetch_add(1);
         Stats().AddTcp(1);
-        std::thread([c, proto]() {
-            SetSockRcvTimeout(c, 10000);
-            try {
-                if (std::string(proto) == "socks5") {
-                    HandleSocks5(c);
-                } else {
-                    HandleHttp(c);
+        try {
+            std::thread([c, proto]() {
+                SetSockRcvTimeout(c, 10000);
+                try {
+                    if (std::string(proto) == "socks5") {
+                        HandleSocks5(c);
+                    } else {
+                        HandleHttp(c);
+                    }
+                } catch (...) {
+                    try {
+                        KillSocket(c);
+                    } catch (...) {
+                    }
                 }
-            } catch (...) {
-            }
+                Stats().DecTcp();
+                g_activeWorkers.fetch_sub(1);
+            }).detach();
+        } catch (...) {
+            // Thread creation can fail under resource exhaustion; the accepted
+            // connection is dropped instead of taking the accept loop down.
+            KillSocket(c);
             Stats().DecTcp();
-        }).detach();
+            g_activeWorkers.fetch_sub(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
     // Listener fd is closed by CoreStop (not here): closing from this thread
     // would race with the shutdown in CoreStop.
 }
 
-void StatsLoop() {
+void StatsLoop(const std::string workDir) {
     while (!gStopFlag.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         if (gStopFlag.load()) break;
@@ -260,7 +326,7 @@ void StatsLoop() {
                            ",\"udp_conns\":" + std::to_string(Stats().udpConns.load()) +
                            ",\"uptime_ms\":" + std::to_string(upMs) + "}\n";
         try {
-            std::string path = g_workDir + "/core_stats.json";
+            std::string path = workDir + "/core_stats.json";
             std::ofstream f(path, std::ios::trunc);
             if (f) f << body;
         } catch (...) {
@@ -268,9 +334,9 @@ void StatsLoop() {
     }
 }
 
-void ClearStatsFile() {
+void ClearStatsFile(const std::string& workDir) {
     try {
-        std::string path = g_workDir + "/core_stats.json";
+        std::string path = workDir + "/core_stats.json";
 #ifdef _WIN32
         _unlink(path.c_str());
 #else
@@ -281,6 +347,15 @@ void ClearStatsFile() {
 }
 
 }  // namespace
+
+// Error strings returned through the C ABI: each calling thread gets its own
+// stable buffer (NAPI copies immediately), avoiding a cross-thread race on a
+// single global std::string.
+thread_local std::string g_tlError;
+const char* SetApiError(const std::string& s) {
+    g_tlError = s;
+    return g_tlError.c_str();
+}
 
 std::string CoreSetWorkingDir(const char* dir) {
     std::lock_guard<std::mutex> lk(g_stateMu);
@@ -293,75 +368,110 @@ std::string CoreSetWorkingDir(const char* dir) {
 }
 
 std::string CoreStart(int fd, const char* cfgName) {
-    std::string startErr;
-    {
-        std::lock_guard<std::mutex> lk(g_stateMu);
-        if (g_running) {
-            return "";
-        }
-        if (g_workDir.empty()) {
-            startErr = "working directory not set";
-        } else {
-            std::string name = (cfgName && *cfgName) ? cfgName : "config";
-            std::string perr;
-            if (!ParseConfigFile(g_workDir, name, perr)) {
-                startErr = perr;
-            }
-        }
-        if (startErr.empty() && fd >= 0) {
-            startErr = StartTun(fd);
-        }
-        if (!startErr.empty()) {
-            return startErr;
-        }
-        g_running = true;
+    // The whole transition runs under the state lock: previously listeners and
+    // threads were created after releasing it, so a concurrent CoreStop()
+    // could tear down a half-started core and leak the listener fds/threads.
+    std::lock_guard<std::mutex> lk(g_stateMu);
+    if (g_running) {
+        return "";
+    }
+    if (g_workDir.empty()) {
+        return "working directory not set";
     }
 
-    Logger& lg = Logger::Get();
-    lg.Log(LogLevel::Info, "Lumine native core starting (fd=" + std::to_string(fd) + ")");
+    bool tunStarted = false;
+    int sfd = FdInvalid;
+    int hfd = FdInvalid;
+    auto fail = [&](const std::string& msg) -> std::string {
+        if (g_statsThr.joinable()) g_statsThr.join();
+        if (g_httpThr.joinable()) g_httpThr.join();
+        if (g_socks5Thr.joinable()) g_socks5Thr.join();
+        g_socks5Lfd = FdInvalid;
+        g_httpLfd = FdInvalid;
+        if (sfd >= 0) KillSocket(sfd);
+        if (hfd >= 0) KillSocket(hfd);
+        if (tunStarted) StopTun();
+        gStopFlag.store(true);
+        return msg;
+    };
 
-    Config& cfg = g_coreConfig;
-    std::string socks5 = cfg.socks5Addr.empty() ? "127.0.0.1:1080" : cfg.socks5Addr;
-    std::string http = cfg.httpAddr.empty() ? "127.0.0.1:1225" : cfg.httpAddr;
+    std::string name = (cfgName && *cfgName) ? cfgName : "config";
+    std::string perr;
+    auto nextCfg = std::make_shared<Config>();
+    if (!ParseConfigFileInto(g_workDir, name, *nextCfg, perr)) {
+        return perr;
+    }
+    // Publish only after the listeners are up, so a failed start leaves the
+    // previous snapshot (or none) in place.
+    std::shared_ptr<const Config> cfgSnapshot = nextCfg;
+
+    gStopFlag.store(false);  // before StartTun: its readers poll this flag
+
+    if (fd >= 0) {
+        std::string terr = StartTun(fd);
+        if (!terr.empty()) {
+            gStopFlag.store(true);
+            return terr;
+        }
+        tunStarted = true;
+    }
 
     if (!NetInitOnce()) {
-        g_running = false;
-        return "socket init failed";
+        return fail("socket init failed");
     }
     ClearDnsCache();
 
+    const Config& cfg = *nextCfg;
+    std::string socks5 = cfg.socks5Addr.empty() ? "127.0.0.1:1080" : cfg.socks5Addr;
+    std::string http = cfg.httpAddr.empty() ? "127.0.0.1:1225" : cfg.httpAddr;
+
     std::string err;
-    int sfd = CreateListener(socks5, 128, err);
+    sfd = CreateListener(socks5, 128, err);
     if (sfd < 0) {
-        if (fd >= 0) StopTun();
-        g_running = false;
-        return "listen " + socks5 + " failed: " + err;
+        return fail("listen " + socks5 + " failed: " + err);
     }
-    int hfd = CreateListener(http, 128, err);
+    hfd = CreateListener(http, 128, err);
     if (hfd < 0) {
-        if (fd >= 0) StopTun();
-        LCLOSE_SOCKET(sfd);
-        g_running = false;
-        return "listen " + http + " failed: " + err;
+        return fail("listen " + http + " failed: " + err);
     }
     g_socks5Lfd = sfd;
     g_httpLfd = hfd;
-    g_lastError.clear();
 
-    gStopFlag.store(false);
+    g_coreConfig = cfgSnapshot;
 
     Stats().down.store(0);
     Stats().up.store(0);
     Stats().blocked.store(0);
     Stats().tcpConns.store(0);
+    Stats().tcpConnsPeak.store(0);
+    Stats().udpConns.store(0);
     Stats().startEpochMs = NowMs();
 
-    g_socks5Thr = std::thread(AcceptLoop, sfd, "socks5");
-    g_httpThr = std::thread(AcceptLoop, hfd, "http");
-    g_statsThr = std::thread(StatsLoop);
+    try {
+        g_socks5Thr = std::thread(AcceptLoop, sfd, "socks5");
+        g_httpThr = std::thread(AcceptLoop, hfd, "http");
+        g_statsThr = std::thread(StatsLoop, g_workDir);
+    } catch (const std::exception& e) {
+        // std::thread construction fails on thread/memory exhaustion; letting
+        // it escape through the C ABI would abort the whole app.
+        gStopFlag.store(true);
+        g_coreConfig.reset();
+        g_socks5Lfd = FdInvalid;
+        g_httpLfd = FdInvalid;
+        KillSocket(sfd);
+        KillSocket(hfd);
+        if (g_statsThr.joinable()) g_statsThr.join();
+        if (g_httpThr.joinable()) g_httpThr.join();
+        if (g_socks5Thr.joinable()) g_socks5Thr.join();
+        if (tunStarted) StopTun();
+        return std::string("cannot start worker threads: ") + e.what();
+    }
 
-    lg.Log(LogLevel::Info, "SOCKS5 listening on " + socks5);
-    lg.Log(LogLevel::Info, "HTTP proxy listening on " + http);
+    g_running = true;
+
+    Logger::Get().Log(LogLevel::Info, "Lumine native core starting (fd=" + std::to_string(fd) + ")");
+    Logger::Get().Log(LogLevel::Info, "SOCKS5 listening on " + socks5);
+    Logger::Get().Log(LogLevel::Info, "HTTP proxy listening on " + http);
     return "";
 }
 
@@ -369,25 +479,25 @@ void CoreStop() {
     {
         std::lock_guard<std::mutex> lk(g_stateMu);
         if (!g_running) {
-            ClearStatsFile();
+            ClearStatsFile(g_workDir);
             return;
         }
         g_running = false;
+        gStopFlag.store(true);
+        StopTun();
+        int sfd = g_socks5Lfd;
+        int hfd = g_httpLfd;
+        g_socks5Lfd = FdInvalid;
+        g_httpLfd = FdInvalid;
+        // Closing the listener sockets is what makes a blocked accept() return
+        // (shutdown() alone is not enough, notably on Windows).
+        if (sfd >= 0) KillSocket(sfd);
+        if (hfd >= 0) KillSocket(hfd);
+        if (g_socks5Thr.joinable()) g_socks5Thr.join();
+        if (g_httpThr.joinable()) g_httpThr.join();
+        if (g_statsThr.joinable()) g_statsThr.join();
+        ClearStatsFile(g_workDir);
     }
-    gStopFlag.store(true);
-    StopTun();
-    int sfd = g_socks5Lfd;
-    int hfd = g_httpLfd;
-    g_socks5Lfd = FdInvalid;
-    g_httpLfd = FdInvalid;
-    // Closing the listener sockets is what makes a blocked accept() return
-    // (shutdown() alone is not enough, notably on Windows).
-    if (sfd >= 0) KillSocket(sfd);
-    if (hfd >= 0) KillSocket(hfd);
-    if (g_socks5Thr.joinable()) g_socks5Thr.join();
-    if (g_httpThr.joinable()) g_httpThr.join();
-    if (g_statsThr.joinable()) g_statsThr.join();
-    ClearStatsFile();
     Logger::Get().Log(LogLevel::Info, "Lumine native core stopped");
 }
 
@@ -401,7 +511,10 @@ std::string CoreCheckConfig() {
     if (g_workDir.empty()) {
         return "working directory not set";
     }
-    if (!ParseConfigFile(g_workDir, "config", err)) {
+    // Validate into a throwaway Config: this entry point can be called while
+    // the core is serving traffic, and must never swap the live snapshot.
+    Config probe;
+    if (!ParseConfigFileInto(g_workDir, "config", probe, err)) {
         return err;
     }
     return "";
@@ -423,9 +536,7 @@ extern "C" {
 void LumineSetWorkingDir(const char* dir) { CoreSetWorkingDir(dir); }
 
 const char* LumineStart(int fd, const char* cfgName) {
-    std::string err = CoreStart(fd, cfgName);
-    g_lastError = err;
-    return g_lastError.c_str();
+    return SetApiError(CoreStart(fd, cfgName));
 }
 
 void LumineStop(void) { CoreStop(); }
@@ -433,19 +544,16 @@ void LumineStop(void) { CoreStop(); }
 int LumineIsRunning(void) { return CoreIsRunning() ? 1 : 0; }
 
 const char* LumineCheckConfig(void) {
-    g_lastError = CoreCheckConfig();
-    return g_lastError.c_str();
+    return SetApiError(CoreCheckConfig());
 }
 
 const char* LumineGetVersion(void) {
-    g_lastError = CoreVersion();
-    return g_lastError.c_str();
+    return SetApiError(CoreVersion());
 }
 
 const char* LumineGetLogs(int maxChunks) {
     (void)maxChunks;
-    g_lastError = CoreGetLogs();
-    return g_lastError.c_str();
+    return SetApiError(CoreGetLogs());
 }
 
 void LumineOnNetworkChanged(void) { CoreOnNetworkChanged(); }
@@ -453,8 +561,7 @@ void LumineOnNetworkChanged(void) { CoreOnNetworkChanged(); }
 void LumineSetLogFileEnabled(int enabled) { Logger::Get().SetFileEnabled(enabled != 0); }
 
 const char* LumineLogFilePath(void) {
-    g_lastError = Logger::Get().FilePath();
-    return g_lastError.c_str();
+    return SetApiError(Logger::Get().FilePath());
 }
 
 void LumineFreeString(const char*) {

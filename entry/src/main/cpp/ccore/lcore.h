@@ -3,6 +3,7 @@
 #define LCORE_LCORE_H
 
 #include <atomic>
+#include <memory>
 #include <string>
 
 #include "lmatcher.h"
@@ -14,9 +15,14 @@ extern std::atomic<bool> gStopFlag;
 
 long long NowMs();
 
-// Process-wide parsed config (set by CoreStart / ParseConfigFile).
-Config& GetCoreConfig();
+// Process-wide parsed config, published as an immutable snapshot. Re-parsing
+// installs a brand-new Config instead of mutating the live one, so a worker
+// thread holding the previous snapshot keeps reading valid memory.
+std::shared_ptr<const Config> GetCoreConfig();
 bool ParseConfigFile(const std::string& dir, const std::string& cfgName, std::string& err);
+// Parses into `out` only; used by the validation entry points that must not
+// touch the config a running core is serving traffic with.
+bool ParseConfigFileInto(const std::string& dir, const std::string& cfgName, Config& out, std::string& err);
 
 // Lifecycle. CoreStart returns "" on success or a non-empty error string.
 std::string CoreSetWorkingDir(const char* dir);

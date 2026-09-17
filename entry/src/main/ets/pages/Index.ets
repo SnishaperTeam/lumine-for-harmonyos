@@ -82,6 +82,7 @@ struct Index {
   private cooldownUntil: number = 0;
   private statsTick: number = 0;
   private shouldRunMarked: boolean = false;
+  private tickBusy: boolean = false;
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
@@ -152,32 +153,44 @@ struct Index {
   }
 
   startPolling(): void {
-    this.pollTimer = setInterval(async () => {
-      if (this.statusStore) {
-        const state: VpnState = await this.statusStore.readVpnState();
-        this.vpnStage = state.stage;
-        if (state.stage === RuntimeStatus.RUNNING) {
-          this.localError = '';
-          if (!this.shouldRunMarked && this.repo) {
-            this.shouldRunMarked = true;
-            this.repo.setVpnShouldRun(true).catch(() => {});
-            this.repo.setLastRunningConfig(this.configName).catch(() => {});
-          }
-        }
-        this.error = state.error || this.localError;
-        this.settlePending(state.stage);
-        this.syncDevListening();
-        this.syncNotification();
-        this.statsTick++;
-        if (state.stats && this.statsTick % 2 === 0) {
-          this.down = formatBytes(state.stats.down);
-          this.up = formatBytes(state.stats.up);
-          this.blocked = String(state.stats.blocked);
-          this.tcpConns = String(state.stats.tcp_conns);
-          this.udpConns = String(state.stats.udp_conns);
+    this.pollTimer = setInterval(() => {
+      this.tick();
+    }, 1000);
+  }
+
+  private async tick(): Promise<void> {
+    if (this.tickBusy || !this.statusStore) {
+      return;
+    }
+    this.tickBusy = true;
+    try {
+      const state: VpnState = await this.statusStore.readVpnState();
+      this.vpnStage = state.stage;
+      if (state.stage === RuntimeStatus.RUNNING) {
+        this.localError = '';
+        if (!this.shouldRunMarked && this.repo) {
+          this.shouldRunMarked = true;
+          this.repo.setVpnShouldRun(true).catch(() => {});
+          this.repo.setLastRunningConfig(this.configName).catch(() => {});
         }
       }
-    }, 1000);
+      this.error = state.error || this.localError;
+      this.settlePending(state.stage);
+      this.syncDevListening();
+      this.syncNotification();
+      this.statsTick++;
+      if (state.stats && this.statsTick % 2 === 0) {
+        this.down = formatBytes(state.stats.down);
+        this.up = formatBytes(state.stats.up);
+        this.blocked = String(state.stats.blocked);
+        this.tcpConns = String(state.stats.tcp_conns);
+        this.udpConns = String(state.stats.udp_conns);
+      }
+    } catch (err) {
+      hilog.error(0x0000, 'LumineUI', 'poll tick failed: %{public}s', String(err));
+    } finally {
+      this.tickBusy = false;
+    }
   }
 
   private settlePending(stage: string): void {

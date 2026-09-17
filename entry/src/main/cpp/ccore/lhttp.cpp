@@ -76,22 +76,37 @@ void HandleHttp(int clientFd) {
     std::string target;
     {
         std::size_t sp1 = requestLine.find(' ');
-        std::size_t sp2 = (sp1 != std::string::npos) ? requestLine.find(' ', sp1 + 1) : std::string::npos;
-        method = requestLine.substr(0, sp1);
-        target = (sp2 != std::string::npos) ? requestLine.substr(sp1 + 1, sp2 - sp1 - 1)
-                                            : requestLine.substr(sp1 + 1);
+        if (sp1 == std::string::npos) {
+            method = requestLine;
+            target = "/";
+        } else {
+            std::size_t sp2 = requestLine.find(' ', sp1 + 1);
+            method = requestLine.substr(0, sp1);
+            target = (sp2 == std::string::npos) ? requestLine.substr(sp1 + 1)
+                                                : requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+        }
     }
 
-    // Host header (for origin-form and for CONNECT fallback).
+    // Host header (for origin-form and for CONNECT fallback). "\nhost:" also
+    // matches the CRLF form, and the value is delimited by the line end so a
+    // missing terminator cannot pull body bytes into the host.
     std::string hostHeader;
     {
         std::string lower = ToLower(requestHead);
-        std::size_t hp = lower.find("\r\nhost:");
-        if (hp == std::string::npos) hp = lower.find("\nhost:");
+        std::size_t hp = lower.find("\nhost:");
         if (hp != std::string::npos) {
-            std::size_t ls = requestHead.find("\r\n", hp);
-            std::size_t le = requestHead.find("\r\n", ls + 2);
-            hostHeader = requestHead.substr(ls + 2, le - ls - 2);
+            std::size_t vs = requestHead.find(':', hp + 1);
+            if (vs != std::string::npos) {
+                std::size_t begin = requestHead.find_first_not_of(" \t", vs + 1);
+                std::size_t ve = requestHead.find_first_of("\r\n", vs + 1);
+                std::size_t end = (ve == std::string::npos) ? requestHead.size() : ve;
+                if (begin != std::string::npos && begin < end) {
+                    std::size_t last = requestHead.find_last_not_of(" \t", end - 1);
+                    if (last != std::string::npos && last >= begin) {
+                        hostHeader = requestHead.substr(begin, last - begin + 1);
+                    }
+                }
+            }
         }
     }
 
@@ -128,7 +143,14 @@ void HandleHttp(int clientFd) {
     }
 
     bool isIP = IsIP(originHost);
-    RouteResult r = Route(GetCoreConfig(), originHost, isIP, false);
+    std::shared_ptr<const Config> cfg = GetCoreConfig();
+    if (!cfg) {
+        lg.Log(LogLevel::Error, "HTTP proxy: no config loaded");
+        WriteResponse(clientFd, "HTTP/1.1 503 Service Unavailable\r\n", "");
+        KillSocket(clientFd);
+        return;
+    }
+    RouteResult r = Route(*cfg, originHost, isIP, false);
 
     if (isConnect) {
         if (r.failed) {
@@ -148,7 +170,9 @@ void HandleHttp(int clientFd) {
         std::string label = "HTTPS CONNECT " + PeerAddr(clientFd) + " -- " + originHost + ":" +
                             std::to_string(originPort) + " -> " + r.dstHost;
         // Any application bytes sent after CONNECT are passed straight through.
-        std::string extra = head.substr(headEnd + 4);
+        // A head without the CRLFCRLF terminator has no trailing bytes at all
+        // (headEnd + 4 would otherwise wrap onto a bogus offset).
+        std::string extra = (headEnd == std::string::npos) ? std::string() : head.substr(headEnd + 4);
         Tunnel(clientFd, -1, r.policy, r.dstHost, originPort, originHost, originPort, label, extra);
         return;
     }

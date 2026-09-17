@@ -141,7 +141,14 @@ void HandleSocks5(int clientFd) {
     int originPort = dstPort;
     bool isIP = IsIP(dstHost);
 
-    RouteResult r = Route(GetCoreConfig(), originHost, isIP, false);
+    std::shared_ptr<const Config> cfg = GetCoreConfig();
+    if (!cfg) {
+        lg.Log(LogLevel::Error, "SOCKS5 no config loaded");
+        SendReply(clientFd, kSocks5ReplyServerFailure);
+        KillSocket(clientFd);
+        return;
+    }
+    RouteResult r = Route(*cfg, originHost, isIP, false);
     if (r.failed) {
         lg.Log(LogLevel::Error, "SOCKS5 route " + originHost + ": failed to resolve/map");
         SendReply(clientFd, kSocks5ReplyHostUnreachable);

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <thread>
 
@@ -21,6 +22,7 @@ namespace {
 constexpr unsigned char kTlsRecordHandshake = 0x16;
 constexpr unsigned char kTlsMajor = 0x03;
 constexpr int kRelayRecvTimeoutMs = 1500;
+constexpr int kMaxFragPieces = 128;  // cap config-driven record/segment counts
 
 // recv up to max; -2 on transient timeout/blocked, -1 on hard error,
 // 0 on EOF, else n>0.
@@ -62,8 +64,21 @@ void RelayCopy(int src, int dst, std::atomic<long long>* counter) {
 void Relay(int cfd, int dfd) {
     SetSockRcvTimeout(cfd, kRelayRecvTimeoutMs);
     SetSockRcvTimeout(dfd, kRelayRecvTimeoutMs);
-    std::thread a(RelayCopy, cfd, dfd, &Stats().down);
-    std::thread b(RelayCopy, dfd, cfd, &Stats().up);
+    // A failure to spawn the second relay thread must not escape as an
+    // exception: Tunnel() is called from detached worker threads, where an
+    // uncaught throw inside a joinable std::thread would abort the process.
+    std::thread a;
+    std::thread b;
+    try {
+        a = std::thread(RelayCopy, cfd, dfd, &Stats().down);
+        b = std::thread(RelayCopy, dfd, cfd, &Stats().up);
+    } catch (...) {
+        LShutdown(cfd, 0);
+        LShutdown(dfd, 0);
+        if (a.joinable()) a.join();
+        if (b.joinable()) b.join();
+        return;
+    }
     a.join();
     b.join();
 }
@@ -241,13 +256,26 @@ void SendTLSAlert(int fd, const unsigned char prtVer[2], unsigned char desc, uns
 
 namespace {
 
-int FindLastDotOrMidPos(const std::string& data, int sniStart, int sniLen) {
-    std::string sub = data.substr(static_cast<size_t>(sniStart), static_cast<size_t>(sniLen));
-    std::size_t dot = sub.rfind('.');
-    if (dot == std::string::npos) {
-        return sniLen / 2 + sniStart;
+// Returns a split position guaranteed to lie in [minFrom, data.size()).
+// A missing/malformed SNI (sniStart == -1, or range out of bounds) falls
+// back to the midpoint instead of feeding a negative offset into substr.
+std::size_t SafeSplitPos(const std::string& data, int sniStart, int sniLen, std::size_t minFrom) {
+    if (data.size() <= minFrom) return minFrom;
+    if (sniStart >= 0 && sniLen > 0) {
+        std::size_t s = static_cast<std::size_t>(sniStart);
+        std::size_t l = static_cast<std::size_t>(sniLen);
+        if (s < data.size() && l <= data.size() - s) {
+            std::size_t dot = data.rfind('.', s + l - 1);
+            std::size_t cut;
+            if (dot == std::string::npos || dot < s) {
+                cut = s + l / 2;
+            } else {
+                cut = dot;
+            }
+            if (cut >= minFrom && cut < data.size()) return cut;
+        }
     }
-    return sniStart + static_cast<int>(dot);
+    return minFrom + (data.size() - minFrom) / 2;
 }
 
 void SplitAndAppend(const std::string& data, std::size_t from, std::size_t to, const std::string& header /*empty=off*/,
@@ -321,8 +349,12 @@ bool SendRecords(int fd, std::string& ch, int sniStart, int sniLen, const HuiPol
 
     int records = pol.numRecords;
     int segments = pol.numSegments;
-    if (records == 0) records = 1;
+    if (records < 1) records = 1;
     if (segments == 0) segments = 1;
+    // Config-controlled counts: clamp so a huge value cannot turn into
+    // thousands of writes/sleeps tying up a worker thread.
+    if (records > kMaxFragPieces) records = kMaxFragPieces;
+    if (segments > kMaxFragPieces) segments = kMaxFragPieces;
 
     if (records == 1) {
         std::string payload = ch;
@@ -334,7 +366,7 @@ bool SendRecords(int fd, std::string& ch, int sniStart, int sniLen, const HuiPol
                 std::string tail = payload.substr(15);
                 if (!WriteAll(fd, head)) { err = "oob 1"; return false; }
                 payload = tail;
-                off -= 15;
+                off -= 15;  // SNI shifts with the stripped head; may go < 0
             }
         }
         if (segments == 1) {
@@ -346,10 +378,10 @@ bool SendRecords(int fd, std::string& ch, int sniStart, int sniLen, const HuiPol
         }
         int leftSeg = segments / 2;
         int rightSeg = segments - leftSeg;
-        int cut = FindLastDotOrMidPos(payload, off, sniLen);
+        std::size_t cut = SafeSplitPos(payload, off, sniLen, 0);
         std::vector<std::string> packets;
-        SplitAndAppend(payload, 0, static_cast<std::size_t>(cut), "", leftSeg, packets);
-        SplitAndAppend(payload, static_cast<std::size_t>(cut), payload.size(), "", rightSeg, packets);
+        SplitAndAppend(payload, 0, cut, "", leftSeg, packets);
+        SplitAndAppend(payload, cut, payload.size(), "", rightSeg, packets);
         for (std::size_t i = 0; i < packets.size(); ++i) {
             if (!WriteAll(fd, packets[i])) {
                 err = "write packet " + std::to_string(i + 1);
@@ -360,13 +392,17 @@ bool SendRecords(int fd, std::string& ch, int sniStart, int sniLen, const HuiPol
         return true;
     }
 
+    if (ch.size() <= 5) {
+        // No handshake payload to split: forward as-is.
+        return WriteAll(fd, ch);
+    }
     int leftChunks = records / 2;
     int rightChunks = records - leftChunks;
     std::vector<std::string> chunks;
-    int cut = FindLastDotOrMidPos(ch, sniStart, sniLen);
+    std::size_t cut = SafeSplitPos(ch, sniStart, sniLen, 5);
     std::string header = ch.substr(0, 3);
-    SplitAndAppend(ch, 5, static_cast<std::size_t>(cut), header, leftChunks, chunks);
-    SplitAndAppend(ch, static_cast<std::size_t>(cut), ch.size(), header, rightChunks, chunks);
+    SplitAndAppend(ch, 5, cut, header, leftChunks, chunks);
+    SplitAndAppend(ch, cut, ch.size(), header, rightChunks, chunks);
 
     if (segments == -1) {
         for (std::size_t i = 0; i < chunks.size(); ++i) {
@@ -407,6 +443,16 @@ bool SendRecords(int fd, std::string& ch, int sniStart, int sniLen, const HuiPol
 }
 
 namespace {
+
+// Closes the referenced fd on scope exit (including stack unwinding from a
+// bad_alloc). cleanup() resets the int to -1 to hand ownership back early.
+struct FdGuard {
+    int& fd;
+    explicit FdGuard(int& f) : fd(f) {}
+    ~FdGuard() {
+        if (fd >= 0) KillSocket(fd);
+    }
+};
 
 bool DialIfNeeded(int& dstFd, const HuiPolicy& pol, const std::string& dstHost, int dstPort, std::string& err) {
     if (dstFd >= 0) return true;
@@ -450,7 +496,10 @@ std::string ReadUntil(int fd, const std::string& delim, std::size_t limit, int t
         if (gStopFlag.load()) break;
         if (!delim.empty() && buf.find(delim) != std::string::npos) break;
         if (buf.size() >= limit) break;
-        int n = ReadSome(fd, tmp, static_cast<int>(sizeof(tmp)));
+        std::size_t remaining = limit - buf.size();
+        int want = static_cast<int>(std::min(sizeof(tmp), remaining));
+        if (want <= 0) break;
+        int n = ReadSome(fd, tmp, want);
         if (n > 0) {
             buf.append(tmp, static_cast<std::size_t>(n));
             if (!delim.empty() && buf.find(delim) != std::string::npos) break;
@@ -465,18 +514,27 @@ std::string ReadUntil(int fd, const std::string& delim, std::size_t limit, int t
     return buf;
 }
 
-bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
+bool Tunnel(int clientFdIn, int dstFdIn, const HuiPolicy& pol,
             const std::string& dstHost, int dstPort,
             const std::string& originHost, int originPort,
             const std::string& label, std::string preBuffered) {
+    int clientFd = clientFdIn;
     int dstFd = dstFdIn;
-    std::string target = dstHost + ":" + std::to_string(dstPort);
+    FdGuard clientGuard(clientFd);
+    FdGuard dstGuard(dstFd);
+    try {
     std::string oldTarget = originHost + ":" + std::to_string(originPort);
     std::string err;
 
     auto cleanup = [&]() {
-        if (clientFd >= 0) KillSocket(clientFd);
-        if (dstFd >= 0) KillSocket(dstFd);
+        if (clientFd >= 0) {
+            KillSocket(clientFd);
+            clientFd = -1;
+        }
+        if (dstFd >= 0) {
+            KillSocket(dstFd);
+            dstFd = -1;
+        }
     };
 
     if (pol.mode == Mode::Raw) {
@@ -486,8 +544,7 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
             return false;
         }
         Relay(clientFd, dstFd);
-        KillSocket(clientFd);
-        KillSocket(dstFd);
+        cleanup();
         return true;
     }
 
@@ -505,7 +562,11 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
         return false;
     }
 
-    bool isTLS = (static_cast<unsigned char>(preBuffered[0]) == kTlsRecordHandshake &&
+    // The sniff loop above may return with as little as one byte (EOF or a
+    // stalled peer), so every later field access needs its own bound check:
+    // the record header is 5 bytes and must exist before reading [3]/[4].
+    bool isTLS = (preBuffered.size() >= 5 &&
+                  static_cast<unsigned char>(preBuffered[0]) == kTlsRecordHandshake &&
                   static_cast<unsigned char>(preBuffered[1]) == kTlsMajor);
     Mode mode = (pol.mode == Mode::Unset) ? Mode::TLSRF : pol.mode;
 
@@ -586,8 +647,7 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
             return false;
         }
         Relay(clientFd, dstFd);
-        KillSocket(clientFd);
-        KillSocket(dstFd);
+        cleanup();
         return true;
     }
 
@@ -595,8 +655,10 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
         // Collect until \r\n\r\n. ReadUntil returns as soon as the delimiter is
         // seen; RecvUpTo would wait for the full 4096 bytes and stall forever on
         // requests pipelined by clients that then wait for the response.
-        if (preBuffered.find("\r\n\r\n") == std::string::npos && preBuffered.size() < (64 << 10)) {
-            std::string more = ReadUntil(clientFd, "\r\n\r\n", (64 << 10) - preBuffered.size(), 1500);
+        constexpr std::size_t kMaxHttpHead = 64 << 10;
+        if (preBuffered.find("\r\n\r\n") == std::string::npos && preBuffered.size() < kMaxHttpHead) {
+            std::size_t room = kMaxHttpHead - std::min(preBuffered.size(), kMaxHttpHead);
+            std::string more = ReadUntil(clientFd, "\r\n\r\n", room, 1500);
             if (!more.empty()) {
                 preBuffered.append(more);
             }
@@ -663,13 +725,8 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
             cleanup();
             return false;
         }
-        if (!DialIfNeeded(dstFd, pol, dstHost, dstPort, err) && dstFd < 0) {
-            cleanup();
-            return false;
-        }
         Relay(clientFd, dstFd);
-        KillSocket(clientFd);
-        KillSocket(dstFd);
+        cleanup();
         return true;
     }
 
@@ -684,9 +741,15 @@ bool Tunnel(int clientFd, int dstFdIn, const HuiPolicy& pol,
         return false;
     }
     Relay(clientFd, dstFd);
-    KillSocket(clientFd);
-    KillSocket(dstFd);
+    cleanup();
     return true;
+    } catch (const std::exception& e) {
+        Logger::Get().Log(LogLevel::Error, label + " tunnel exception: " + e.what());
+        return false;
+    } catch (...) {
+        Logger::Get().Log(LogLevel::Error, label + " tunnel unknown exception");
+        return false;
+    }
 }
 
 }  // namespace lcore

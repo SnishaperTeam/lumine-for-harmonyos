@@ -13,6 +13,11 @@ struct Cursor {
     explicit Cursor(const std::string& str) : s(str), i(0) {}
 };
 
+// RFC 8259 allows implementations to cap nesting depth. Without a cap a
+// malicious document (e.g. thousands of nested arrays from a remote
+// subscription) exhausts the stack and crashes the process.
+constexpr int kMaxDepth = 64;
+
 bool SkipWs(Cursor& c) {
     while (c.i < c.s.size() && (c.s[c.i] == ' ' || c.s[c.i] == '\t' || c.s[c.i] == '\n' || c.s[c.i] == '\r')) {
         ++c.i;
@@ -20,7 +25,7 @@ bool SkipWs(Cursor& c) {
     return c.i < c.s.size();
 }
 
-bool ParseValue(Cursor& c, Json& out, std::string& err);
+bool ParseValue(Cursor& c, Json& out, std::string& err, int depth);
 
 void AppendUtf8(std::string& out, unsigned int cp) {
     if (cp < 0x80) {
@@ -87,6 +92,35 @@ bool ParseString(Cursor& c, Json& out, std::string& err) {
                         }
                         cp = (cp << 4) | static_cast<unsigned int>(hv);
                     }
+                    // Combine UTF-16 surrogate pairs; lone surrogates are
+                    // invalid JSON and must not be emitted as bad UTF-8.
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (c.i + 11 >= c.s.size() || c.s[c.i + 6] != '\\' || c.s[c.i + 7] != 'u') {
+                            err = "truncated surrogate pair";
+                            return false;
+                        }
+                        unsigned int lo = 0;
+                        for (int k = 0; k < 4; ++k) {
+                            int hv = HexVal(c.s[c.i + 8 + k]);
+                            if (hv < 0) {
+                                err = "bad surrogate pair";
+                                return false;
+                            }
+                            lo = (lo << 4) | static_cast<unsigned int>(hv);
+                        }
+                        if (lo < 0xDC00 || lo > 0xDFFF) {
+                            err = "invalid low surrogate";
+                            return false;
+                        }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        AppendUtf8(val, cp);
+                        c.i += 10;  // consume both \uXXXX escapes
+                        break;
+                    }
+                    if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        err = "unexpected low surrogate";
+                        return false;
+                    }
                     AppendUtf8(val, cp);
                     c.i += 4;
                     break;
@@ -107,19 +141,49 @@ bool ParseString(Cursor& c, Json& out, std::string& err) {
 
 bool ParseNumber(Cursor& c, Json& out, std::string& err) {
     size_t start = c.i;
-    if (c.s[c.i] == '-') ++c.i;
-    while (c.i < c.s.size() && (isdigit(static_cast<unsigned char>(c.s[c.i])) || c.s[c.i] == '.' || c.s[c.i] == 'e' || c.s[c.i] == 'E' || c.s[c.i] == '+' || c.s[c.i] == '-')) {
+    if (c.i < c.s.size() && c.s[c.i] == '-') ++c.i;
+    // integer part: "0" or [1-9] digits
+    if (c.i >= c.s.size() || !isdigit(static_cast<unsigned char>(c.s[c.i]))) {
+        err = "invalid number";
+        return false;
+    }
+    if (c.s[c.i] == '0') {
         ++c.i;
+    } else {
+        while (c.i < c.s.size() && isdigit(static_cast<unsigned char>(c.s[c.i]))) ++c.i;
+    }
+    // fraction: '.' 1*DIGIT
+    if (c.i < c.s.size() && c.s[c.i] == '.') {
+        ++c.i;
+        size_t fracStart = c.i;
+        while (c.i < c.s.size() && isdigit(static_cast<unsigned char>(c.s[c.i]))) ++c.i;
+        if (c.i == fracStart) {
+            err = "invalid number fraction";
+            return false;
+        }
+    }
+    // exponent: [eE] [+-]? 1*DIGIT
+    if (c.i < c.s.size() && (c.s[c.i] == 'e' || c.s[c.i] == 'E')) {
+        ++c.i;
+        if (c.i < c.s.size() && (c.s[c.i] == '+' || c.s[c.i] == '-')) ++c.i;
+        size_t expStart = c.i;
+        while (c.i < c.s.size() && isdigit(static_cast<unsigned char>(c.s[c.i]))) ++c.i;
+        if (c.i == expStart) {
+            err = "invalid number exponent";
+            return false;
+        }
     }
     out.type = Json::Type::Number;
     out.num = strtod(c.s.c_str() + start, nullptr);
-    if (out.num == 0 && c.s.substr(start, c.i - start) != "0" && c.s.substr(start, c.i - start) != "-0") {
-        // strtod parsed fine for everything we feed it from configs; keep going.
-    }
+    (void)start;
     return true;
 }
 
-bool ParseObject(Cursor& c, Json& out, std::string& err) {
+bool ParseObject(Cursor& c, Json& out, std::string& err, int depth) {
+    if (depth > kMaxDepth) {
+        err = "nesting too deep";
+        return false;
+    }
     ++c.i;  // '{'
     out.type = Json::Type::Object;
     for (;;) {
@@ -143,7 +207,7 @@ bool ParseObject(Cursor& c, Json& out, std::string& err) {
         }
         ++c.i;
         Json val;
-        if (!ParseValue(c, val, err)) return false;
+        if (!ParseValue(c, val, err, depth)) return false;
         out.obj.emplace_back(std::move(key.str), std::move(val));
         if (!SkipWs(c)) {
             err = "truncated object";
@@ -162,7 +226,11 @@ bool ParseObject(Cursor& c, Json& out, std::string& err) {
     }
 }
 
-bool ParseArray(Cursor& c, Json& out, std::string& err) {
+bool ParseArray(Cursor& c, Json& out, std::string& err, int depth) {
+    if (depth > kMaxDepth) {
+        err = "nesting too deep";
+        return false;
+    }
     ++c.i;  // '['
     out.type = Json::Type::Array;
     for (;;) {
@@ -175,7 +243,7 @@ bool ParseArray(Cursor& c, Json& out, std::string& err) {
             return true;
         }
         Json val;
-        if (!ParseValue(c, val, err)) return false;
+        if (!ParseValue(c, val, err, depth)) return false;
         out.arr.push_back(std::move(val));
         if (!SkipWs(c)) {
             err = "truncated array";
@@ -194,15 +262,15 @@ bool ParseArray(Cursor& c, Json& out, std::string& err) {
     }
 }
 
-bool ParseValue(Cursor& c, Json& out, std::string& err) {
+bool ParseValue(Cursor& c, Json& out, std::string& err, int depth) {
     if (!SkipWs(c)) {
         err = "unexpected end of input";
         return false;
     }
     char ch = c.s[c.i];
     switch (ch) {
-        case '{': return ParseObject(c, out, err);
-        case '[': return ParseArray(c, out, err);
+        case '{': return ParseObject(c, out, err, depth + 1);
+        case '[': return ParseArray(c, out, err, depth + 1);
         case '"': return ParseString(c, out, err);
         case 't':
             if (c.s.compare(c.i, 4, "true") == 0) {
@@ -252,7 +320,7 @@ bool ParseValue(Cursor& c, Json& out, std::string& err) {
 
 bool Json::Parse(const std::string& text, Json& out, std::string& err) {
     Cursor c(text);
-    if (!ParseValue(c, out, err)) {
+    if (!ParseValue(c, out, err, 1)) {
         return false;
     }
     SkipWs(c);

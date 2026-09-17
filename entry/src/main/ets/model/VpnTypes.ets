@@ -27,6 +27,39 @@ export interface NAT64Profile {
   prefix: string;
 }
 
+export function sanitizeNAT64Profiles(raw: string): NAT64Profile[] {
+  const out: NAT64Profile[] = [];
+  if (raw.length === 0) {
+    return out;
+  }
+  let parsed: Object | null = null;
+  try {
+    parsed = JSON.parse(raw) as Object;
+  } catch (err) {
+    return out;
+  }
+  if (!Array.isArray(parsed)) {
+    return out;
+  }
+  for (const item of parsed as Object[]) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      continue;
+    }
+    const source = item as Record<string, Object>;
+    const name = typeof source['name'] === 'string' ? source['name'] as string : '';
+    const prefix = typeof source['prefix'] === 'string' ? source['prefix'] as string : '';
+    if (name.length === 0 || prefix.length === 0) {
+      continue;
+    }
+    const id = typeof source['id'] === 'string' && (source['id'] as string).length > 0
+      ? source['id'] as string
+      : prefix;
+    const profile: NAT64Profile = { id: id, name: name, prefix: prefix };
+    out.push(profile);
+  }
+  return out;
+}
+
 export interface SubscriptionProfile {
   id: string;
   name: string;

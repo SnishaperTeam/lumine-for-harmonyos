@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -69,6 +70,50 @@ inline void Wr32(unsigned char* p, uint32_t v) {
     p[2] = static_cast<unsigned char>((v >> 8) & 0xFF);
     p[3] = static_cast<unsigned char>(v & 0xFF);
 }
+
+// Descriptor slot shared by a flow/mapping and every thread that touches its
+// socket. Close() takes the slot exclusively, so it can never run while a
+// send/recv is in flight on the same descriptor; without this a descriptor
+// closed by the reaper/stop path could be recycled by the OS and the next
+// write would land on an unrelated socket.
+class FdSlot {
+  public:
+    void Set(int fd) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        if (fd_ >= 0 && fd_ != fd) KillSocket(fd_);
+        fd_ = fd;
+    }
+
+    void Close() {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        if (fd_ >= 0) {
+            KillSocket(fd_);
+            fd_ = FdInvalid;
+        }
+    }
+
+    int Get() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return fd_;
+    }
+
+    template <typename Fn>
+    void Use(Fn fn) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (fd_ >= 0) fn(fd_);
+    }
+
+    template <typename Fn>
+    auto Call(Fn fn, decltype(fn(0)) fallback) const -> decltype(fn(0)) {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (fd_ < 0) return fallback;
+        return fn(fd_);
+    }
+
+  private:
+    mutable std::shared_mutex mu_;
+    int fd_ = FdInvalid;
+};
 
 uint16_t Checksum(const unsigned char* data, std::size_t len) {
     uint32_t sum = 0;
@@ -213,16 +258,11 @@ struct UdpMapping {
     uint16_t srcPort = 0;
     unsigned char dstIp[16] = {0};
     uint16_t dstPort = 0;
-    int fd = FdInvalid;
-    long long lastActive = 0;
+    FdSlot sock;
+    std::atomic<long long> lastActive{0};
 
     void ReaderLoop();
-    void Close() {
-        if (fd >= 0) {
-            LCLOSE_SOCKET(fd);
-            fd = FdInvalid;
-        }
-    }
+    void Close() { sock.Close(); }
 };
 
 bool TunEngine::BuildUdp(int family, const unsigned char* src, const unsigned char* dst,
@@ -292,9 +332,12 @@ void TunEngine::HandleUdp(const unsigned char* pkt, int len, int family,
     {
         std::lock_guard<std::mutex> lk(mu);
         auto it = udp.find(key);
-        if (it != udp.end()) {
+        // A mapping whose socket has already been closed by the reaper is
+        // stale: its reader owns the erase, so replace the entry instead of
+        // resurrecting a dead descriptor.
+        if (it != udp.end() && it->second->sock.Get() >= 0) {
             m = it->second;
-        } else if (udp.size() >= kMaxUdpMappings) {
+        } else if (it == udp.end() && udp.size() >= kMaxUdpMappings) {
             Logger::Get().Log(LogLevel::Warn, "TUN udp mapping table full, drop");
             return;
         }
@@ -307,24 +350,37 @@ void TunEngine::HandleUdp(const unsigned char* pkt, int len, int family,
         m->srcPort = sport;
         std::memcpy(m->dstIp, dst, family == 4 ? 4 : 16);
         m->dstPort = dport;
-        m->fd = socket(family == 4 ? AF_INET : AF_INET6, SOCK_DGRAM, 0);
-        if (m->fd < 0) return;
+        int ufd = static_cast<int>(socket(family == 4 ? AF_INET : AF_INET6, SOCK_DGRAM, 0));
+        if (ufd < 0) return;
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
-        setsockopt(m->fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-        m->lastActive = SteadyMs();
+        setsockopt(ufd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        m->sock.Set(ufd);
+        m->lastActive.store(SteadyMs());
         std::lock_guard<std::mutex> lk(mu);
         udp[key] = m;
         Stats().udpConns++;
-        std::thread([m]() { m->ReaderLoop(); }).detach();
+        try {
+            std::thread([m]() { m->ReaderLoop(); }).detach();
+        } catch (...) {
+            Logger::Get().Log(LogLevel::Error, "TUN cannot spawn udp reader, mapping dropped");
+            udp.erase(key);
+            Stats().udpConns--;
+            m->Close();
+            return;
+        }
     }
-    m->lastActive = SteadyMs();
+    m->lastActive.store(SteadyMs());
     struct sockaddr_storage ss;
     socklen_t slen = 0;
     if (MakeSockAddr(IpToString(family, dst), dport, ss, slen) != 0) return;
-    int sent = static_cast<int>(sendto(SOCKET_CAST(m->fd), reinterpret_cast<const char*>(payload),
-                                       payloadLen, 0, reinterpret_cast<struct sockaddr*>(&ss), slen));
+    int sent = m->sock.Call(
+        [&](int ufd) {
+            return static_cast<int>(sendto(SOCKET_CAST(ufd), reinterpret_cast<const char*>(payload),
+                                           payloadLen, 0, reinterpret_cast<struct sockaddr*>(&ss), slen));
+        },
+        -1);
     if (sent > 0) {
         Stats().up.fetch_add(payloadLen);
     }
@@ -333,8 +389,12 @@ void TunEngine::HandleUdp(const unsigned char* pkt, int len, int family,
 void UdpMapping::ReaderLoop() {
     unsigned char buf[65535];
     for (;;) {
-        if (gStopFlag.load() || fd < 0) break;
-        int n = static_cast<int>(recv(SOCKET_CAST(fd), reinterpret_cast<char*>(buf), sizeof(buf), 0));
+        if (gStopFlag.load() || sock.Get() < 0) break;
+        int n = sock.Call(
+            [&](int mfd) {
+                return static_cast<int>(recv(SOCKET_CAST(mfd), reinterpret_cast<char*>(buf), sizeof(buf), 0));
+            },
+            0);
         if (n <= 0) {
             if (n < 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -343,8 +403,8 @@ void UdpMapping::ReaderLoop() {
             break;
         }
         long long now = SteadyMs();
-        if (now - lastActive > kUdpIdleMs) break;
-        lastActive = now;
+        if (now - lastActive.load() > kUdpIdleMs) break;
+        lastActive.store(now);
         std::vector<unsigned char> pkt;
         TunEngine& e = Engine();
         if (e.BuildUdp(family, dstIp, srcIp, dstPort, srcPort, buf, n, pkt)) {
@@ -352,10 +412,17 @@ void UdpMapping::ReaderLoop() {
             Stats().down.fetch_add(n);
         }
     }
-    Engine().mu.lock();
-    Engine().udp.erase(key);
-    Engine().mu.unlock();
-    Stats().udpConns--;
+    {
+        TunEngine& e = Engine();
+        std::lock_guard<std::mutex> lk(e.mu);
+        auto it = e.udp.find(key);
+        // Only the mapping that is still registered may erase the slot: a
+        // replacement created after the reaper closed this one owns it now.
+        if (it != e.udp.end() && it->second.get() == this) {
+            e.udp.erase(it);
+            Stats().udpConns--;
+        }
+    }
     Close();
 }
 
@@ -499,7 +566,7 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
     int mss = kMssV4;
 
     std::mutex fmu;
-    FlowState state = FlowState::SynReceived;
+    std::atomic<FlowState> state{FlowState::SynReceived};
     uint32_t clIsn = 0;
     uint32_t clNext = 0;    // next expected seq from client
     uint32_t iss = 0;       // our ISN
@@ -507,15 +574,16 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
     uint32_t clAck = 0;
     std::deque<TcpSegment> sendQ;
     int retxCount = 0;
-    long long rto = kRtoInitMs;
-    long long lastSendOrAck = 0;
-    long long lastActive = 0;
+    std::atomic<long long> rto{kRtoInitMs};
+    std::atomic<long long> lastSendOrAck{0};
+    std::atomic<long long> lastActive{0};
+    std::atomic<bool> reaped{false};
     bool finQueued = false;
     bool finAcked = false;
     bool clientFinSeen = false;
     uint32_t clientFinSeq = 0;
 
-    int realFd = FdInvalid;
+    FdSlot sock;
     std::atomic<bool> dialing{false};
     std::atomic<bool> dialed{false};
     std::atomic<bool> readerStarted{false};
@@ -594,12 +662,12 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
     }
 
     // ---- transmit / ack bookkeeping (call with fmu held) ----
-    void TransmitLocked() {
+    void TransmitLocked(long long nowMs) {
         for (const auto& s : sendQ) {
             SendNow(s.fin ? (TcpFlags::ACK | TcpFlags::FIN | TcpFlags::PSH) : (TcpFlags::ACK | TcpFlags::PSH),
                     s.seq, clNext, s.data.data(), static_cast<int>(s.data.size()));
         }
-        lastSendOrAck = now;
+        lastSendOrAck.store(nowMs);
     }
 
     void EnqueueDown(const unsigned char* data, int len, bool fin) {
@@ -614,7 +682,7 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
                             : (TcpFlags::ACK | TcpFlags::PSH);
         const TcpSegment& seg = sendQ.back();
         SendNow(flags, seg.seq, clNext, seg.data.data(), static_cast<int>(seg.data.size()));
-        lastSendOrAck = now;
+        lastSendOrAck.store(now);
     }
 
     void OnAckLocked(uint32_t ack) {
@@ -639,8 +707,8 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
             }
             sendQ.pop_front();
             retxCount = 0;
-            rto = kRtoInitMs;
-            lastSendOrAck = now;
+            rto.store(kRtoInitMs);
+            lastSendOrAck.store(now);
         }
         if (sendQ.empty() && finQueued && finAcked && clientFinSeen && state != FlowState::Closed) {
             state = FlowState::Closed;
@@ -648,20 +716,32 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
     }
 
     // ---- lifecycle ----
+    // Idempotent: the first caller wins, later callers return immediately. The
+    // flow registers itself in the engine map, so teardown must always erase it
+    // and drop the connection counter no matter which state it reached.
     void Teardown(bool sendRstToClient) {
+        if (reaped.exchange(true)) return;
+        uint32_t rstSeq = 0;
+        uint32_t rstAck = 0;
         {
             std::lock_guard<std::mutex> lk(fmu);
-            if (state == FlowState::Closed) return;
+            rstSeq = nxt;
+            rstAck = clNext;
             state = FlowState::Closed;
         }
-        if (sendRstToClient) SendRst();
-        if (realFd >= 0) {
-            KillSocket(realFd);
-            realFd = FdInvalid;
+        if (sendRstToClient) {
+            SendNow(TcpFlags::RST | TcpFlags::ACK, rstSeq, rstAck, nullptr, 0);
         }
-        std::lock_guard<std::mutex> lk(Engine().mu);
-        Engine().flows.erase(Key());
-        Stats().DecTcp();
+        sock.Close();
+        {
+            TunEngine& e = Engine();
+            std::lock_guard<std::mutex> lk(e.mu);
+            auto it = e.flows.find(Key());
+            if (it != e.flows.end() && it->second.get() == this) {
+                e.flows.erase(it);
+                Stats().DecTcp();
+            }
+        }
     }
 
     void RealToTunLoop();
@@ -673,6 +753,7 @@ struct TcpFlow : public std::enable_shared_from_this<TcpFlow> {
 void TunEngine::HandleTcp(const unsigned char* pkt, int len, int family,
                           const unsigned char* src, const unsigned char* dst,
                           int l4off, int l4len) {
+    (void)len;
     if (l4len < 20) return;
     const unsigned char* tcp = pkt + l4off;
     uint16_t sport = Rd16(tcp);
@@ -729,7 +810,7 @@ void TunEngine::HandleTcp(const unsigned char* pkt, int len, int family,
         flow->nxt = isn + 1;
         flow->clAck = seq;
         flow->now = SteadyMs();
-        flow->lastActive = flow->now;
+        flow->lastActive.store(flow->now);
         {
             std::lock_guard<std::mutex> lk(mu);
             flows[key] = flow;
@@ -743,7 +824,7 @@ void TunEngine::HandleTcp(const unsigned char* pkt, int len, int family,
     {
         std::unique_lock<std::mutex> lk(flow->fmu);
         flow->now = SteadyMs();
-        flow->lastActive = flow->now;
+        flow->lastActive.store(flow->now);
         if (flags & TcpFlags::RST) {
             lk.unlock();
             flow->Teardown(false);
@@ -771,8 +852,8 @@ void TunEngine::HandleTcp(const unsigned char* pkt, int len, int family,
             flow->clientFinSeen = true;
             flow->clientFinSeq = seq + static_cast<uint32_t>(payloadLen);
             flow->SendNow(TcpFlags::ACK, flow->nxt, flow->clNext, nullptr, 0);
-            if (flow->dialed.load() && flow->realFd >= 0) {
-                LShutdown(flow->realFd, 1);
+            if (flow->dialed.load()) {
+                flow->sock.Use([](int sfd) { LShutdown(sfd, 1); });
             }
             if (flow->state == FlowState::Established) flow->state = FlowState::ClientFin;
             if (flow->sendQ.empty() && flow->finQueued && flow->finAcked) {
@@ -879,16 +960,27 @@ void TunEngine::ReapTick() {
     {
         std::lock_guard<std::mutex> lk(mu);
         for (auto& kv : flows) {
-            if (now - kv.second->lastActive > kFlowIdleMs) {
+            if (now - kv.second->lastActive.load() > kFlowIdleMs) {
                 expired.push_back(kv.second);
-            } else if (!kv.second->sendQ.empty() && now - kv.second->lastSendOrAck >= kv.second->rto) {
-                retx.push_back(kv.second);
+            } else if (!kv.second->reaped.load()) {
+                bool pending = false;
+                long long last = 0;
+                long long rto = 0;
+                {
+                    std::lock_guard<std::mutex> flk(kv.second->fmu);
+                    pending = !kv.second->sendQ.empty();
+                }
+                last = kv.second->lastSendOrAck.load();
+                rto = kv.second->rto.load();
+                if (pending && now - last >= rto) {
+                    retx.push_back(kv.second);
+                }
             }
         }
     }
     for (auto& f : retx) {
         std::unique_lock<std::mutex> lk(f->fmu);
-        if (f->state == FlowState::Closed) continue;
+        if (f->state == FlowState::Closed || f->reaped.load()) continue;
         if (f->sendQ.empty()) continue;
         f->retxCount++;
         if (f->retxCount > kMaxRetx) {
@@ -897,9 +989,8 @@ void TunEngine::ReapTick() {
             f->Teardown(true);
             continue;
         }
-        f->rto = std::min<long long>(f->rto * 2, kRtoMaxMs);
-        f->lastSendOrAck = now;
-        f->TransmitLocked();
+        f->rto.store(std::min<long long>(f->rto.load() * 2, kRtoMaxMs));
+        f->TransmitLocked(now);
     }
     for (auto& f : expired) {
         Logger::Get().Log(LogLevel::Info, f->Label() + " idle timeout");
@@ -909,36 +1000,61 @@ void TunEngine::ReapTick() {
     {
         std::lock_guard<std::mutex> lk(mu);
         for (auto& kv : udp) {
-            if (now - kv.second->lastActive > kUdpIdleMs) deadUdp.push_back(kv.second);
+            if (now - kv.second->lastActive.load() > kUdpIdleMs) deadUdp.push_back(kv.second);
         }
     }
     for (auto& m : deadUdp) {
-        KillSocket(m->fd);  // wakes the reader, which erases itself
+        // Close through the slot so the reader thread cannot close the same
+        // descriptor a second time after the OS recycled the number.
+        m->Close();
     }
 }
 
 // ---- client data path ------------------------------------------------------
 
 void TcpFlowHandleClientData(std::shared_ptr<TcpFlow> flow, std::vector<unsigned char> data) {
-    Logger& lg = Logger::Get();
-    if (flow->dialed.load() && flow->realFd >= 0) {
-        if (!WriteAll(flow->realFd, reinterpret_cast<const char*>(data.data()), data.size())) {
+    if (flow->reaped.load()) {
+        return;
+    }
+    bool direct = false;
+    {
+        // The dialed flag and the pre-dial buffer are manipulated under fmu by
+        // DialWorker as well, so sampling both here cannot lose bytes into a
+        // buffer that was already drained.
+        std::lock_guard<std::mutex> lk(flow->fmu);
+        if (flow->reaped.load() || flow->state == FlowState::Closed) {
+            return;
+        }
+        if (flow->dialed.load()) {
+            direct = true;
+        } else {
+            flow->upBuf.append(reinterpret_cast<const char*>(data.data()), data.size());
+        }
+    }
+    if (direct) {
+        bool ok = flow->sock.Call(
+            [&](int fd) {
+                return WriteAll(fd, reinterpret_cast<const char*>(data.data()), data.size());
+            },
+            false);
+        if (!ok) {
             flow->Teardown(true);
+            return;
         }
         Stats().up.fetch_add(data.size());
         return;
     }
-    if (flow->dialing.load()) {
-        std::lock_guard<std::mutex> lk(flow->fmu);
-        flow->upBuf.append(reinterpret_cast<const char*>(data.data()), data.size());
+    bool expected = false;
+    if (!flow->dialing.compare_exchange_strong(expected, true)) {
         return;
     }
-    flow->dialing.store(true);
-    {
-        std::lock_guard<std::mutex> lk(flow->fmu);
-        flow->upBuf.append(reinterpret_cast<const char*>(data.data()), data.size());
+    try {
+        std::thread([flow]() { flow->DialWorker(); }).detach();
+    } catch (...) {
+        Logger::Get().Log(LogLevel::Error, flow->Label() + " cannot spawn dial worker");
+        flow->dialing.store(false);
+        flow->Teardown(true);
     }
-    std::thread([flow]() { flow->DialWorker(); }).detach();
 }
 
 void TcpFlow::RealToTunLoop() {
@@ -946,7 +1062,6 @@ void TcpFlow::RealToTunLoop() {
     char buf[16384];
     for (;;) {
         if (gStopFlag.load() || state == FlowState::Closed) break;
-        if (realFd < 0) break;
         std::size_t pending = 0;
         {
             std::lock_guard<std::mutex> lk(fmu);
@@ -956,10 +1071,14 @@ void TcpFlow::RealToTunLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
-        int n = static_cast<int>(recv(SOCKET_CAST(realFd), buf, sizeof(buf), 0));
+        int n = sock.Call(
+            [&](int fd) {
+                return static_cast<int>(recv(SOCKET_CAST(fd), buf, sizeof(buf), 0));
+            },
+            0);
         if (n > 0) {
             std::lock_guard<std::mutex> lk(fmu);
-            if (state == FlowState::Closed) break;
+            if (state == FlowState::Closed || reaped.load()) break;
             Stats().down.fetch_add(n);
             std::size_t off = 0;
             while (off < static_cast<std::size_t>(n)) {
@@ -998,9 +1117,14 @@ void TcpFlow::RealToTunLoop() {
 
 void TcpFlow::DialWorker() {
     Logger& lg = Logger::Get();
-    TunEngine& e = Engine();
 
-    RouteResult r = Route(GetCoreConfig(), dstIpStr, true, false);
+    std::shared_ptr<const Config> cfg = GetCoreConfig();
+    if (!cfg) {
+        lg.Log(LogLevel::Error, Label() + " no config loaded");
+        Teardown(true);
+        return;
+    }
+    RouteResult r = Route(*cfg, dstIpStr, true, false);
     if (r.blocked) {
         lg.Log(LogLevel::Info, Label() + " blocked by policy");
         Stats().blocked++;
@@ -1023,7 +1147,11 @@ void TcpFlow::DialWorker() {
         Teardown(true);
         return;
     }
-    realFd = fd;
+    if (reaped.load()) {
+        KillSocket(fd);
+        return;
+    }
+    sock.Set(fd);
     dialed.store(true);
 
     std::string first;
@@ -1033,7 +1161,7 @@ void TcpFlow::DialWorker() {
     }
 
     if (!first.empty()) {
-        bool isTLS = first.size() >= 2 &&
+        bool isTLS = first.size() >= 5 &&
                      static_cast<unsigned char>(first[0]) == 0x16 &&
                      static_cast<unsigned char>(first[1]) == 0x03;
         Mode mode = (policy.mode == Mode::Unset) ? Mode::TLSRF : policy.mode;
@@ -1045,10 +1173,17 @@ void TcpFlow::DialWorker() {
                 if (ph.ok && mode == Mode::TLSRF && ph.sniStart > 0 && ph.sniLen > 0) {
                     std::string record = first.substr(0, recLen);
                     std::string ferr;
-                    if (SendRecords(fd, record, ph.sniStart, ph.sniLen, policy, ferr)) {
+                    bool sent = sock.Call(
+                        [&](int realFd) { return SendRecords(realFd, record, ph.sniStart, ph.sniLen, policy, ferr); },
+                        false);
+                    if (sent) {
                         std::string tail = first.substr(recLen);
-                        if (!tail.empty() &&
-                            !WriteAll(fd, reinterpret_cast<const char*>(tail.data()), tail.size())) {
+                        bool tailOk = tail.empty() || sock.Call(
+                            [&](int realFd) {
+                                return WriteAll(realFd, reinterpret_cast<const char*>(tail.data()), tail.size());
+                            },
+                            false);
+                        if (!tailOk) {
                             Teardown(true);
                             return;
                         }
@@ -1062,7 +1197,12 @@ void TcpFlow::DialWorker() {
                         return;
                     }
                 } else {
-                    if (!WriteAll(fd, reinterpret_cast<const char*>(first.data()), first.size())) {
+                    bool written = sock.Call(
+                        [&](int realFd) {
+                            return WriteAll(realFd, reinterpret_cast<const char*>(first.data()), first.size());
+                        },
+                        false);
+                    if (!written) {
                         Teardown(true);
                         return;
                     }
@@ -1070,14 +1210,24 @@ void TcpFlow::DialWorker() {
                 }
             } else {
                 lg.Log(LogLevel::Warn, Label() + " partial TLS record in first segment, forward raw");
-                if (!WriteAll(fd, reinterpret_cast<const char*>(first.data()), first.size())) {
+                bool written = sock.Call(
+                    [&](int realFd) {
+                        return WriteAll(realFd, reinterpret_cast<const char*>(first.data()), first.size());
+                    },
+                    false);
+                if (!written) {
                     Teardown(true);
                     return;
                 }
                 sniffDone = true;
             }
         } else {
-            if (!WriteAll(fd, reinterpret_cast<const char*>(first.data()), first.size())) {
+            bool written = sock.Call(
+                [&](int realFd) {
+                    return WriteAll(realFd, reinterpret_cast<const char*>(first.data()), first.size());
+                },
+                false);
+            if (!written) {
                 Teardown(true);
                 return;
             }
@@ -1087,8 +1237,16 @@ void TcpFlow::DialWorker() {
     }
 
     SetSockRcvTimeout(fd, 1500);
+    if (reaped.load()) {
+        return;
+    }
     if (!readerStarted.exchange(true)) {
-        std::thread([self = this->shared_from_this()]() { self->RealToTunLoop(); }).detach();
+        try {
+            std::thread([self = this->shared_from_this()]() { self->RealToTunLoop(); }).detach();
+        } catch (...) {
+            Logger::Get().Log(LogLevel::Error, Label() + " cannot spawn reader thread");
+            Teardown(true);
+        }
     }
 }
 
@@ -1116,8 +1274,18 @@ std::string StartTun(int fd) {
     g_tunFd = fd;
     gStopFlag.store(false);
     e.running.store(true);
-    g_tunReader = std::thread(TunEngineReadLoop);
-    g_tunTimer = std::thread(TunEngineTimerLoop);
+    try {
+        g_tunReader = std::thread(TunEngineReadLoop);
+        g_tunTimer = std::thread(TunEngineTimerLoop);
+    } catch (...) {
+        e.running.store(false);
+        gStopFlag.store(true);
+        e.tunFd = FdInvalid;
+        g_tunFd = FdInvalid;
+        LCLOSE_SOCKET(fd);
+        if (g_tunReader.joinable()) g_tunReader.join();
+        return "cannot start tun threads";
+    }
     Logger::Get().Log(LogLevel::Info, "TUN engine started (fd=" + std::to_string(fd) + ")");
     return "";
 }
@@ -1141,11 +1309,23 @@ void StopTun() {
         e.udp.clear();
     }
     for (auto& f : allFlows) {
-        if (f->realFd >= 0) KillSocket(f->realFd);
+        // Mark reaped first so the detached flow workers cannot re-register or
+        // close the descriptor a second time, then drop the socket.
+        f->reaped.store(true);
+        {
+            std::lock_guard<std::mutex> flk(f->fmu);
+            f->state = FlowState::Closed;
+        }
+        f->sock.Close();
     }
     for (auto& m : allUdp) {
-        if (m->fd >= 0) LCLOSE_SOCKET(m->fd);
+        m->Close();
     }
+    // The maps were cleared wholesale, so the per-flow/per-mapping decrements
+    // never ran; reset the counters instead of leaving them drifting upward.
+    Stats().tcpConns.store(0);
+    Stats().tcpConnsPeak.store(0);
+    Stats().udpConns.store(0);
     if (g_tunReader.joinable()) g_tunReader.join();
     if (g_tunTimer.joinable()) g_tunTimer.join();
     Logger::Get().Log(LogLevel::Info, "TUN engine stopped");

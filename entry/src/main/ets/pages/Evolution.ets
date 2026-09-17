@@ -5,7 +5,7 @@ import { ConfigRepository } from '../data/ConfigRepository';
 import { PrefsStore } from '../data/PrefsStore';
 import { NetworkMonitor, mapNat64 } from '../service/NetworkMonitor';
 import { LumineConfig, Policy } from '../model/LumineConfig';
-import { NAT64Profile } from '../model/VpnTypes';
+import { sanitizeNAT64Profiles } from '../model/VpnTypes';
 
 interface EvoResult {
   domain: string;
@@ -82,11 +82,9 @@ struct Evolution {
         const ctx = getContext(this) as common.UIAbilityContext;
         const prefs = await PrefsStore.getInstance(ctx);
         const raw = await prefs.getString('nat64Profiles', '');
-        if (raw.length > 0) {
-          const profiles = JSON.parse(raw) as NAT64Profile[];
-          if (profiles.length > 0) {
-            prefix = profiles[0].prefix;
-          }
+        const profiles = sanitizeNAT64Profiles(raw);
+        if (profiles.length > 0) {
+          prefix = profiles[0].prefix;
         }
       } catch (err) {
       }

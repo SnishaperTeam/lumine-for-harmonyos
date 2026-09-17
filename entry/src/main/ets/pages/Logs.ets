@@ -26,6 +26,7 @@ const FILTER_OPTIONS: FilterOption[] = [
 ];
 
 const MAX_UI_LOGS: number = 1000;
+const MAX_LOG_CHUNK_BYTES: number = 256 * 1024;
 
 function classifyLine(line: string): string {
   if (line.indexOf('ERROR') >= 0) {
@@ -85,6 +86,7 @@ struct Logs {
   private useFileFallback: boolean = false;
   private logFilePath: string = '';
   private logOffset: number = 0;
+  private pollBusy: boolean = false;
   private scroller: Scroller = new Scroller();
 
   aboutToAppear(): void {
@@ -126,15 +128,19 @@ struct Logs {
       }
       const size: number = fileIo.statSync(this.logFilePath).size;
       if (size <= this.logOffset) {
-        this.logOffset = size;
+        this.logOffset = size > 0 ? size : 0;
         return '';
       }
-      const length: number = size - this.logOffset;
+      const pending: number = size - this.logOffset;
+      const length: number = pending > MAX_LOG_CHUNK_BYTES ? MAX_LOG_CHUNK_BYTES : pending;
       const fd = fileIo.openSync(this.logFilePath, fileIo.OpenMode.READ_ONLY);
       try {
         const buf = new ArrayBuffer(length);
         const read: number = fileIo.readSync(fd.fd, buf, { offset: this.logOffset, length: length });
-        this.logOffset = size;
+        if (read <= 0) {
+          return '';
+        }
+        this.logOffset += read;
         const decoder = new util.TextDecoder('utf-8');
         return decoder.decodeToString(new Uint8Array(buf, 0, read));
       } finally {
@@ -174,16 +180,25 @@ struct Logs {
   }
 
   async poll(): Promise<void> {
-    if (this.statusStore) {
-      const state: VpnState = await this.statusStore.readVpnState();
-      this.vpnStage = state.stage;
-    }
-    if (!this.captureEnabled) {
+    if (this.pollBusy) {
       return;
     }
-    const chunk = await this.readChunk();
-    if (chunk.length > 0) {
-      this.appendLines(chunk);
+    this.pollBusy = true;
+    try {
+      if (this.statusStore) {
+        const state: VpnState = await this.statusStore.readVpnState();
+        this.vpnStage = state.stage;
+      }
+      if (!this.captureEnabled) {
+        return;
+      }
+      const chunk = await this.readChunk();
+      if (chunk.length > 0) {
+        this.appendLines(chunk);
+      }
+    } catch (err) {
+    } finally {
+      this.pollBusy = false;
     }
   }
 
@@ -274,8 +289,14 @@ struct Logs {
       const body: string = 'Lumine Log Export\nExported-At: ' + exportedAt +
         '\nLog-Lines: ' + lines.length + '\n\n' + lines.join('\n');
       const fd = fileIo.openSync(path, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(fd.fd, body);
-      fileIo.closeSync(fd);
+      try {
+        fileIo.writeSync(fd.fd, body);
+      } finally {
+        try {
+          fileIo.closeSync(fd);
+        } catch (closeErr) {
+        }
+      }
       this.pruneOldExports(dir);
       this.exportMsg = '已导出到 ' + path;
     } catch (err) {

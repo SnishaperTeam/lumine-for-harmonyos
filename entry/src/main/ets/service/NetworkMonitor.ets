@@ -91,25 +91,37 @@ export class NetworkMonitor {
   }
 
   start(): void {
-    this.netConn = connection.createNetConnection();
-    this.netConn.register(() => {
-    });
-    this.netConn.on('netAvailable', (data: connection.NetHandle) => {
-      this.scheduleNotify();
-    });
-    this.netConn.on('netLost', (data: connection.NetHandle) => {
-      this.scheduleNotify();
-    });
-    this.netConn.on('netCapabilitiesChange', (data: connection.NetCapabilityInfo) => {
-      this.scheduleNotify();
-    });
+    if (this.netConn !== null) {
+      this.stop();
+    }
+    const conn = connection.createNetConnection();
+    this.netConn = conn;
+    try {
+      conn.register(() => {
+      });
+      conn.on('netAvailable', (data: connection.NetHandle) => {
+        this.scheduleNotify();
+      });
+      conn.on('netLost', (data: connection.NetHandle) => {
+        this.scheduleNotify();
+      });
+      conn.on('netCapabilitiesChange', (data: connection.NetCapabilityInfo) => {
+        this.scheduleNotify();
+      });
+    } catch (err) {
+      this.netConn = null;
+    }
   }
 
   stop(): void {
-    if (this.netConn) {
-      this.netConn.unregister(() => {
-      });
-      this.netConn = null;
+    const conn = this.netConn;
+    this.netConn = null;
+    if (conn) {
+      try {
+        conn.unregister(() => {
+        });
+      } catch (err) {
+      }
     }
     if (this.debounceTimer >= 0) {
       clearTimeout(this.debounceTimer);

@@ -9,6 +9,7 @@ import { generateConfigName } from '../common/Formatters';
 
 const NEW_SUBSCRIPTION_ID = '__new_subscription__';
 const CORE_RUNNING_HINT = 'core is running, cannot validate config now';
+const MAX_SUBSCRIPTION_BYTES: number = 4 * 1024 * 1024;
 
 interface ImportState {
   stage: string;
@@ -58,11 +59,13 @@ function formatAbsoluteTime(timestamp: number): string {
 function sortSubscriptions(list: SubscriptionProfile[]): SubscriptionProfile[] {
   const out = list.slice();
   out.sort((a: SubscriptionProfile, b: SubscriptionProfile) => {
-    if (a.updatedAt !== b.updatedAt) {
-      return b.updatedAt - a.updatedAt;
+    const at = typeof a.updatedAt === 'number' && Number.isFinite(a.updatedAt) ? a.updatedAt : 0;
+    const bt = typeof b.updatedAt === 'number' && Number.isFinite(b.updatedAt) ? b.updatedAt : 0;
+    if (at !== bt) {
+      return bt - at;
     }
-    const an = a.name.toLowerCase();
-    const bn = b.name.toLowerCase();
+    const an = typeof a.name === 'string' ? a.name.toLowerCase() : '';
+    const bn = typeof b.name === 'string' ? b.name.toLowerCase() : '';
     if (an < bn) {
       return -1;
     }
@@ -72,6 +75,33 @@ function sortSubscriptions(list: SubscriptionProfile[]): SubscriptionProfile[] {
     return 0;
   });
   return out;
+}
+
+function sanitizeSubscription(value: Object): SubscriptionProfile | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const source = value as Record<string, Object>;
+  const name = typeof source['name'] === 'string' ? source['name'] as string : '';
+  const url = typeof source['url'] === 'string' ? source['url'] as string : '';
+  const configName = typeof source['configName'] === 'string' ? source['configName'] as string : '';
+  if (name.length === 0 || configName.length === 0) {
+    return null;
+  }
+  const id = typeof source['id'] === 'string' && (source['id'] as string).length > 0
+    ? source['id'] as string
+    : configName;
+  const updatedAt = typeof source['updatedAt'] === 'number' && Number.isFinite(source['updatedAt'] as number)
+    ? source['updatedAt'] as number
+    : 0;
+  const profile: SubscriptionProfile = {
+    id: id,
+    name: name,
+    url: url,
+    configName: configName,
+    updatedAt: updatedAt
+  };
+  return profile;
 }
 
 @Entry
@@ -135,7 +165,15 @@ struct Subscription {
     const raw = await this.prefs.getString('subscriptions', '[]');
     let loaded: SubscriptionProfile[] = [];
     try {
-      loaded = JSON.parse(raw) as SubscriptionProfile[];
+      const parsed = JSON.parse(raw) as Object;
+      if (Array.isArray(parsed)) {
+        for (const item of parsed as Object[]) {
+          const profile = sanitizeSubscription(item);
+          if (profile !== null) {
+            loaded.push(profile);
+          }
+        }
+      }
     } catch (err) {
       loaded = [];
     }
@@ -177,6 +215,10 @@ struct Subscription {
   }
 
   async downloadText(url: string): Promise<string> {
+    const lower = url.toLowerCase();
+    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
+      throw new Error('订阅链接必须是 http:// 或 https:// 地址');
+    }
     this.destroyCurrentRequest();
     const req = http.createHttp();
     this.currentRequest = req;
@@ -195,10 +237,14 @@ struct Subscription {
       const resp = await req.request(url, options);
       const body = resp.result as string;
       if (resp.responseCode < 200 || resp.responseCode > 299) {
-        throw new Error(('订阅请求失败: HTTP ' + resp.responseCode + ' ' + body.substring(0, 160)).trim());
+        const preview = typeof body === 'string' ? body.substring(0, 160) : '';
+        throw new Error(('订阅请求失败: HTTP ' + resp.responseCode + ' ' + preview).trim());
       }
-      if (body.length === 0) {
+      if (typeof body !== 'string' || body.length === 0) {
         throw new Error('订阅内容不是有效的 Lumine 配置 JSON');
+      }
+      if (body.length > MAX_SUBSCRIPTION_BYTES) {
+        throw new Error('订阅内容过大（超过 4 MB），已拒绝导入');
       }
       return body;
     } finally {

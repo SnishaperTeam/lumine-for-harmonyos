@@ -8,7 +8,19 @@
 
 namespace lcore {
 
-std::vector<std::string> ExpandPattern(const std::string& s) {
+namespace {
+
+// DoS guards for attacker-controlled rule keys (subscription configs):
+// nested "(a|b)" groups multiply the output exponentially, and deep nesting
+// grows the call stack. On any violation the rule is dropped (empty result).
+constexpr size_t kMaxPatternLen = 1024;
+constexpr int kMaxPatternDepth = 16;
+constexpr size_t kMaxPatternExpansions = 256;
+
+bool ExpandPatternImpl(const std::string& s, int depth, size_t& budget,
+                       std::vector<std::string>& out) {
+    if (depth > kMaxPatternDepth || s.size() > kMaxPatternLen) return false;
+
     size_t left = std::string::npos;
     for (size_t i = 0; i < s.size(); ++i) {
         if (s[i] == '(') {
@@ -17,38 +29,54 @@ std::vector<std::string> ExpandPattern(const std::string& s) {
         }
     }
     if (left == std::string::npos) {
-        return SplitByPipe(s);
+        for (const auto& part : SplitByPipe(s)) {
+            if (budget == 0) return false;
+            --budget;
+            out.push_back(part);
+        }
+        return true;
     }
     size_t right = std::string::npos;
-    int depth = 1;
+    int parenDepth = 1;
     for (size_t i = left + 1; i < s.size(); ++i) {
         if (s[i] == '(') {
-            ++depth;
+            ++parenDepth;
         } else if (s[i] == ')') {
-            --depth;
-            if (depth == 0) {
+            --parenDepth;
+            if (parenDepth == 0) {
                 right = i;
                 break;
             }
         }
     }
-    if (right == std::string::npos) {
-        return SplitByPipe(s);
-    }
+    if (right == std::string::npos) return false;  // unbalanced parentheses
+
     std::string prefix = s.substr(0, left);
     std::string inner = s.substr(left + 1, right - left - 1);
     std::string suffix = s.substr(right + 1);
 
-    std::vector<std::string> parts = SplitByPipe(inner);
-    std::vector<std::string> suffixResults = ExpandPattern(suffix);
-    std::vector<std::string> result;
-    result.reserve(parts.size() * suffixResults.size());
-    for (const auto& part : parts) {
+    std::vector<std::string> suffixResults;
+    if (!ExpandPatternImpl(suffix, depth + 1, budget, suffixResults)) return false;
+
+    for (const auto& part : SplitByPipe(inner)) {
         for (const auto& suff : suffixResults) {
-            result.push_back(prefix + part + suff);
+            if (budget == 0) return false;
+            --budget;
+            out.push_back(prefix + part + suff);
         }
     }
-    return result;
+    return true;
+}
+
+}  // namespace
+
+std::vector<std::string> ExpandPattern(const std::string& s) {
+    std::vector<std::string> out;
+    size_t budget = kMaxPatternExpansions;
+    if (!ExpandPatternImpl(s, 1, budget, out)) {
+        return {};  // malformed or too-expansive pattern: drop the rule
+    }
+    return out;
 }
 
 // ------------- IP helpers -------------
@@ -60,27 +88,47 @@ bool IsIP(const std::string& s) {
     return inet_pton(AF_INET, s.c_str(), &a) == 1 || inet_pton(AF_INET6, s.c_str(), &a6) == 1;
 }
 
+namespace {
+
+// Strict non-negative integer parse for the prefix length. Returns false on
+// empty input, signs, non-digits or overflow (atoi accepted garbage silently).
+bool ParsePrefixLen(const char* p, int& out) {
+    if (!p || !*p) return false;
+    long long v = 0;
+    for (const char* q = p; *q; ++q) {
+        if (*q < '0' || *q > '9') return false;
+        v = v * 10 + (*q - '0');
+        if (v > 128) return false;  // wider than the maximum legal v6 prefix
+    }
+    out = static_cast<int>(v);
+    return true;
+}
+
+}  // namespace
+
 int ParseIpOrCidr(const std::string& s, int& family, unsigned char out[16], int& bits) {
-    std::string ip = s;
     bits = -1;
     size_t slash = s.find('/');
+    std::string ip = (slash == std::string::npos) ? s : s.substr(0, slash);
+    int parsedBits = -1;
     if (slash != std::string::npos) {
-        ip = s.substr(0, slash);
-        bits = atoi(s.c_str() + slash + 1);
+        if (!ParsePrefixLen(s.c_str() + slash + 1, parsedBits)) return -1;
     }
     in_addr a4;
     if (inet_pton(AF_INET, ip.c_str(), &a4) == 1) {
+        if (parsedBits > 32) return -1;  // out-of-range prefix would read past out[4]
         family = 4;
         std::memcpy(out, &a4, 4);
         std::memset(out + 4, 0, 12);
-        if (bits == -1) bits = 32;
+        bits = (parsedBits < 0) ? 32 : parsedBits;
         return 0;
     }
     in6_addr a6;
     if (inet_pton(AF_INET6, ip.c_str(), &a6) == 1) {
+        if (parsedBits > 128) return -1;
         family = 6;
         std::memcpy(out, &a6, 16);
-        if (bits == -1) bits = 128;
+        bits = (parsedBits < 0) ? 128 : parsedBits;
         return 0;
     }
     return -1;

@@ -23,16 +23,30 @@
 static std::string g_napiWorkDir;
 
 static std::string NapiGetString(napi_env env, napi_value val) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, val, &type) != napi_ok || type != napi_string) {
+        return std::string();
+    }
     size_t len = 0;
-    napi_get_value_string_utf8(env, val, nullptr, 0, &len);
-    std::string str(len, '\0');
-    napi_get_value_string_utf8(env, val, &str[0], len + 1, &len);
+    if (napi_get_value_string_utf8(env, val, nullptr, 0, &len) != napi_ok) {
+        return std::string();
+    }
+    // The UTF-8 getter writes len bytes plus a NUL, so the destination must be
+    // one byte larger than the reported length.
+    std::string str(len + 1, '\0');
+    size_t written = 0;
+    if (napi_get_value_string_utf8(env, val, &str[0], len + 1, &written) != napi_ok) {
+        return std::string();
+    }
+    str.resize(written);
     return str;
 }
 
 static napi_value NapiOwnString(napi_env env, const std::string& str) {
-    napi_value result;
-    napi_create_string_utf8(env, str.c_str(), str.length(), &result);
+    napi_value result = nullptr;
+    if (napi_create_string_utf8(env, str.c_str(), str.length(), &result) != napi_ok) {
+        napi_get_undefined(env, &result);
+    }
     return result;
 }
 
@@ -113,6 +127,9 @@ static napi_value NapiCheckConfigJson(napi_env env, napi_callback_info info) {
         return NapiOwnString(env, "working directory not set");
     }
     std::string json = NapiGetString(env, args[0]);
+    if (json.empty()) {
+        return NapiOwnString(env, "empty config json");
+    }
     std::string path = g_napiWorkDir + "/configs/_check.json";
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -121,12 +138,16 @@ static napi_value NapiCheckConfigJson(napi_env env, napi_callback_info info) {
         }
         f << json;
     }
+    // Validate into a local Config so the check can never swap (or clear) the
+    // snapshot a running core is serving traffic with, even if the core is
+    // started between the guard above and this call.
     std::string err;
-    if (!lcore::ParseConfigFile(g_napiWorkDir, "_check", err)) {
-        std::remove(path.c_str());
+    lcore::Config probe;
+    bool ok = lcore::ParseConfigFileInto(g_napiWorkDir, "_check", probe, err);
+    std::remove(path.c_str());
+    if (!ok) {
         return NapiOwnString(env, err);
     }
-    std::remove(path.c_str());
     return NapiOwnString(env, "");
 }
 
